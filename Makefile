@@ -3,10 +3,18 @@ CC      ?= gcc
 CFLAGS  ?= -std=c11 -Wall -Wextra -Werror -Wshadow -Wconversion -Iinclude
 BUILD   ?= /tmp/blackbox-build
 
-.PHONY: test test-none test-file csv2json-test clean
+.PHONY: test test-none test-file test-unity csv2json-test clean
 
-test: test-none test-file
+test: test-none test-file test-unity
 	@echo "all tests passed"
+
+# Unity / single-header build: the test TU itself pulls in the implementation (no src/blackbox.c).
+test-unity:
+	@mkdir -p $(BUILD)
+	@echo "[test] unity (BLACKBOX_IMPLEMENTATION in the app TU)"
+	@$(CC) $(CFLAGS) -DBLACKBOX_PERSIST=0 -DBLACKBOX_CLOCK=test_clock -DBLACKBOX_IMPLEMENTATION \
+	    test/test_blackbox.c -o $(BUILD)/test_unity
+	@$(BUILD)/test_unity
 
 # BLACKBOX_PERSIST numeric values mirror blackbox.h (NONE=0, FILE=1).
 test-none:

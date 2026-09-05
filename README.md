@@ -17,12 +17,17 @@ make csv2json-test # runs csv2json over the example fixtures
 ```
 
 ## Using it (C)
-Configure with `#define`s **before** including `blackbox.h` (typically from a project adapter):
+blackbox is a **single-header** library. Configure with `#define`s **before** including it, and in
+**one** translation unit also define `BLACKBOX_IMPLEMENTATION` (typically the app's unity TU — a
+project adapter does this):
 ```c
-#define BLACKBOX_PERSIST  BLACKBOX_PERSIST_FILE   /* NONE | FILE | MDS_FLASH(esp32,P3) | CUSTOM */
-#define BLACKBOX_CLOCK    my_clock                /* int my_clock(char *out, size_t n)          */
+#define BLACKBOX_PERSIST         BLACKBOX_PERSIST_FILE   /* NONE | FILE | MDS_FLASH(esp32,P3) | CUSTOM */
+#define BLACKBOX_CLOCK           my_clock                /* int my_clock(char *out, size_t n)          */
+#define BLACKBOX_IMPLEMENTATION                          /* in ONE TU only                             */
 #include "blackbox.h"
 ```
+Other translation units just `#include "blackbox.h"` for the declarations. (`src/blackbox.c` is a
+ready-made implementation TU for builds that prefer a standalone object over unity.)
 Describe each record type (struct + encoder + a descriptor). The descriptor carries the encoder, so
 `blackbox_insert` stays generic:
 ```c
