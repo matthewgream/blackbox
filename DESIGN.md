@@ -306,8 +306,10 @@ Then: add more record types per device — the shared **lifecycle** record is th
 ## 12. P1 implementation notes (this repo)
 - **Backends implemented:** `NONE` (pool-as-ring; on esp32 an `RTC_NOINIT` pool → survives deep
   sleep) and `FILE` (host). `MDS_FLASH` and `CUSTOM` `#error` for now (P3) so a misconfig fails loud.
-- **Default is DISABLED** — `blackbox_enable(h, true)` to opt in. (Per-record-type enable/disable is a
-  planned filter — the `filters` field in the status is the placeholder.)
+- **Default is DISABLED** — `blackbox_enable(h, true)` to opt in.
+- **Tag filtering (implemented):** tags are capped at `BLACKBOX_TAG_MAX` chars (default 8→uint64, or
+  4→uint32) and packed into that integer, so `blackbox_filter_mode/add/remove/clear` do include/exclude
+  by integer compare (not strcmp). Status reports mode, list size, and a `filtered` count.
 - **Status** (`blackbox_status_t` + `blackbox_status_str(st, flags, buf, n)`): enabled, persist,
   filters, count/dropped/inserted/flushes, bytes/used%/pool_sz, uptime. Renders selectively via the
   `BLACKBOX_STATUS_*` section flags. This is what the gateway's MQTT status query returns.

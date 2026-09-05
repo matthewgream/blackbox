@@ -47,6 +47,32 @@ int BLACKBOX_CLOCK(char *out, size_t n);   /* forward-declare the configured hoo
 #define BLACKBOX_LINE_MAX 160
 #endif
 
+/* -------- tags: capped + packed into an integer for fast include/exclude matching ------------- */
+/* A tag is at most BLACKBOX_TAG_MAX chars, packed little-endian into blackbox_tag_t, so filter
+ * matching is a single integer compare rather than strcmp. 4 chars → uint32, 8 chars → uint64. */
+#ifndef BLACKBOX_TAG_MAX
+#define BLACKBOX_TAG_MAX 8
+#endif
+#if BLACKBOX_TAG_MAX <= 4
+typedef uint32_t blackbox_tag_t;
+#else
+typedef uint64_t blackbox_tag_t;
+#endif
+
+/* -------- record-type filter (a small fixed-size map of packed tags) -------------------------- */
+#ifndef BLACKBOX_FILTER_MAX
+#define BLACKBOX_FILTER_MAX 16          /* max tags in the include/exclude list */
+#endif
+#define BLACKBOX_FILTER_OFF     0u      /* record everything (default)              */
+#define BLACKBOX_FILTER_INCLUDE 1u      /* record ONLY the listed tags              */
+#define BLACKBOX_FILTER_EXCLUDE 2u      /* record all EXCEPT the listed tags        */
+
+typedef struct {
+    uint8_t        mode;                /* BLACKBOX_FILTER_*         */
+    uint8_t        count;
+    blackbox_tag_t tags[BLACKBOX_FILTER_MAX];
+} blackbox_filter_t;
+
 /* -------- record descriptor (one per record type; the project defines these) ------------------ */
 
 typedef struct blackbox_struct_config {
@@ -77,10 +103,12 @@ typedef struct {
 
 typedef struct {
     bool     enabled;
-    uint32_t filters;               /* reserved: per-record-type filter mask (0 = none yet)       */
+    uint8_t  filter_mode;           /* BLACKBOX_FILTER_* in effect                                */
+    uint8_t  filter_count;          /* tags in the filter list                                    */
     int      persist;               /* which backend (BLACKBOX_PERSIST_*)                         */
     uint32_t count;                 /* records currently stored                                   */
     uint32_t dropped;               /* records dropped (disabled, full, or encode error)          */
+    uint32_t filtered;              /* records skipped by the tag filter                          */
     uint32_t inserted;              /* records accepted since init/clear (monotonic)              */
     uint32_t flushes;               /* number of persist operations                               */
     uint32_t bytes;                 /* bytes currently stored                                     */
@@ -99,8 +127,9 @@ typedef struct {
 typedef struct {
     const blackbox_config_t *cfg;
     bool     enabled;
+    blackbox_filter_t filter;       /* record-type include/exclude filter                         */
     size_t   pool_len;              /* bytes currently staged/stored in the pool                  */
-    uint32_t count, dropped, inserted, flushes, stored_bytes;
+    uint32_t count, dropped, filtered, inserted, flushes, stored_bytes;
     uint32_t flush_timer_ms;        /* accumulated by blackbox_tick, reset on a BATCH_TIME flush  */
     uint32_t uptime_ms;             /* accumulated by blackbox_tick, monotonic                    */
     void    *be;                    /* backend state (opaque; set by the backend at init)         */
@@ -133,6 +162,15 @@ bool blackbox_status(blackbox_handle_t *h, blackbox_status_t *out);
 int  blackbox_status_str(const blackbox_status_t *st, uint32_t flags, char *buf, size_t n);
 
 void blackbox_enable(blackbox_handle_t *h, bool on);
+
+/* Record-type filter: pack `tag` (≤ BLACKBOX_TAG_MAX chars) and include/exclude it; matching on
+ * insert is an integer compare. Default mode is OFF (record everything). */
+void blackbox_filter_mode  (blackbox_handle_t *h, uint8_t mode);    /* BLACKBOX_FILTER_*   */
+int  blackbox_filter_add   (blackbox_handle_t *h, const char *tag); /* 0 ok, -1 list full  */
+void blackbox_filter_remove(blackbox_handle_t *h, const char *tag);
+void blackbox_filter_clear (blackbox_handle_t *h);
+blackbox_tag_t blackbox_tag_pack(const char *tag);
+
 void blackbox_deinit(blackbox_handle_t *h);
 
 /* ==================================================================================================
@@ -165,6 +203,29 @@ typedef struct { const char *path; } blackbox_file_be_t;
 static uint8_t blackbox__used_pct(const blackbox_handle_t *h) {
     if (!h->cfg->pool_sz) return 0;
     return (uint8_t)((h->pool_len * 100u) / h->cfg->pool_sz);
+}
+
+blackbox_tag_t blackbox_tag_pack(const char *tag) {
+    blackbox_tag_t t = 0;
+    for (int i = 0; i < BLACKBOX_TAG_MAX && tag[i]; i++)
+        t |= (blackbox_tag_t)(unsigned char)tag[i] << (8 * i);
+    return t;
+}
+
+static bool blackbox__filter_pass(const blackbox_handle_t *h, blackbox_tag_t t) {
+    if (h->filter.mode == BLACKBOX_FILTER_OFF) return true;
+    bool found = false;
+    for (uint8_t i = 0; i < h->filter.count; i++)
+        if (h->filter.tags[i] == t) { found = true; break; }
+    return (h->filter.mode == BLACKBOX_FILTER_INCLUDE) ? found : !found;
+}
+
+static const char *blackbox__filter_name(uint8_t m) {
+    switch (m) {
+    case BLACKBOX_FILTER_INCLUDE: return "include";
+    case BLACKBOX_FILTER_EXCLUDE: return "exclude";
+    default:                      return "off";
+    }
 }
 
 /* Append one assembled line (ln bytes, includes the trailing '\n') into the store. */
@@ -220,6 +281,7 @@ int blackbox_init(blackbox_handle_t *h, const blackbox_config_t *cfg) {
 int blackbox_insert(blackbox_handle_t *h, const blackbox_struct_config_t *sc, const void *data) {
     if (!h || !sc || !sc->encode) return -1;
     if (!h->enabled) { h->dropped++; return 0; }
+    if (!blackbox__filter_pass(h, blackbox_tag_pack(sc->tag))) { h->filtered++; return 0; }
 
     char payload[BLACKBOX_LINE_MAX];
     const int pn = sc->encode(sc, data, payload, sizeof(payload));
@@ -328,12 +390,14 @@ void blackbox_expire(blackbox_handle_t *h) {
 
 bool blackbox_status(blackbox_handle_t *h, blackbox_status_t *out) {
     if (!h || !out) return false;
-    out->enabled  = h->enabled;
-    out->filters  = 0;                          /* per-record-type filters: not yet */
-    out->persist  = BLACKBOX_PERSIST;
-    out->count    = h->count;
-    out->dropped  = h->dropped;
-    out->inserted = h->inserted;
+    out->enabled      = h->enabled;
+    out->filter_mode  = h->filter.mode;
+    out->filter_count = h->filter.count;
+    out->persist      = BLACKBOX_PERSIST;
+    out->count        = h->count;
+    out->dropped      = h->dropped;
+    out->filtered     = h->filtered;
+    out->inserted     = h->inserted;
     out->flushes  = h->flushes;
     out->bytes    = h->stored_bytes;
     out->pool_sz  = (uint32_t)h->cfg->pool_sz;
@@ -362,9 +426,9 @@ int blackbox_status_str(const blackbox_status_t *st, uint32_t flags, char *buf, 
     } while (0)
     BLACKBOX__APPEND("bb:");
     if (flags & BLACKBOX_STATUS_STATE)
-        BLACKBOX__APPEND(" enabled=%d persist=%s filters=0x%X", st->enabled ? 1 : 0, blackbox__persist_name(st->persist), (unsigned)st->filters);
+        BLACKBOX__APPEND(" enabled=%d persist=%s filter=%s(%u)", st->enabled ? 1 : 0, blackbox__persist_name(st->persist), blackbox__filter_name(st->filter_mode), (unsigned)st->filter_count);
     if (flags & BLACKBOX_STATUS_COUNTS)
-        BLACKBOX__APPEND(" count=%u dropped=%u inserted=%u flushes=%u", (unsigned)st->count, (unsigned)st->dropped, (unsigned)st->inserted, (unsigned)st->flushes);
+        BLACKBOX__APPEND(" count=%u dropped=%u filtered=%u inserted=%u flushes=%u", (unsigned)st->count, (unsigned)st->dropped, (unsigned)st->filtered, (unsigned)st->inserted, (unsigned)st->flushes);
     if (flags & BLACKBOX_STATUS_STORAGE)
         BLACKBOX__APPEND(" bytes=%u/%u(%u%%)", (unsigned)st->bytes, (unsigned)st->pool_sz, (unsigned)st->used_pct);
     if (flags & BLACKBOX_STATUS_TIMING)
@@ -375,6 +439,31 @@ int blackbox_status_str(const blackbox_status_t *st, uint32_t flags, char *buf, 
 
 void blackbox_enable(blackbox_handle_t *h, bool on) {
     if (h) h->enabled = on;
+}
+
+void blackbox_filter_mode(blackbox_handle_t *h, uint8_t mode) {
+    if (h) h->filter.mode = mode;
+}
+int blackbox_filter_add(blackbox_handle_t *h, const char *tag) {
+    if (!h || !tag) return -1;
+    const blackbox_tag_t t = blackbox_tag_pack(tag);
+    for (uint8_t i = 0; i < h->filter.count; i++)
+        if (h->filter.tags[i] == t) return 0;           /* already present */
+    if (h->filter.count >= BLACKBOX_FILTER_MAX) return -1;
+    h->filter.tags[h->filter.count++] = t;
+    return 0;
+}
+void blackbox_filter_remove(blackbox_handle_t *h, const char *tag) {
+    if (!h || !tag) return;
+    const blackbox_tag_t t = blackbox_tag_pack(tag);
+    for (uint8_t i = 0; i < h->filter.count; i++)
+        if (h->filter.tags[i] == t) {
+            h->filter.tags[i] = h->filter.tags[--h->filter.count];  /* swap-remove */
+            return;
+        }
+}
+void blackbox_filter_clear(blackbox_handle_t *h) {
+    if (h) { h->filter.count = 0; h->filter.mode = BLACKBOX_FILTER_OFF; }
 }
 
 void blackbox_deinit(blackbox_handle_t *h) {

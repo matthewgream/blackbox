@@ -43,6 +43,28 @@ int main(void) {
     while (blackbox_pull(&h, &cur, line, sizeof line) > 0) { printf("    %s\n", line); nrec++; }
     assert(nrec == 5);
 
+    /* tag filter (integer-packed matching) */
+    evt_t ef = { 7, 7 };
+    blackbox_clear(&h);
+    blackbox_filter_mode(&h, BLACKBOX_FILTER_EXCLUDE);
+    assert(blackbox_filter_add(&h, "LC") == 0);
+    (void)blackbox_insert(&h, &cfg_evt, &ef);              /* LC excluded → filtered */
+    blackbox_status(&h, &st);
+    assert(st.count == 0 && st.filtered >= 1 && st.filter_mode == BLACKBOX_FILTER_EXCLUDE && st.filter_count == 1);
+    blackbox_filter_clear(&h);
+    blackbox_filter_mode(&h, BLACKBOX_FILTER_INCLUDE);
+    blackbox_filter_add(&h, "XX");
+    (void)blackbox_insert(&h, &cfg_evt, &ef);              /* LC not in include list → filtered */
+    blackbox_status(&h, &st);
+    assert(st.count == 0);
+    blackbox_filter_add(&h, "LC");
+    (void)blackbox_insert(&h, &cfg_evt, &ef);              /* LC now included → recorded */
+    blackbox_status(&h, &st);
+    assert(st.count == 1);
+    printf("  filter ok (filtered=%u, tag_bytes=%zu)\n", st.filtered, sizeof(blackbox_tag_t));
+    blackbox_filter_clear(&h);
+    blackbox_clear(&h);
+
     blackbox_enable(&h, false);
     evt_t e2 = { 9, 999 };
     (void)blackbox_insert(&h, &cfg_evt, &e2);

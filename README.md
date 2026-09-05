@@ -70,6 +70,16 @@ const { csvToJson, parseDefinitions } = require('./js/csv2json'); // module
 The struct's field names become the JSON keys (numeric C types → numbers, else strings). Parsed
 dynamically per run — no codegen.
 
+## Tag filtering
+Tags are capped at `BLACKBOX_TAG_MAX` chars (default **8** → `uint64`; set to **4** → `uint32`) and
+packed into that integer, so include/exclude matching on insert is a single integer compare:
+```c
+blackbox_filter_mode(&h, BLACKBOX_FILTER_EXCLUDE);   /* _OFF (default) | _INCLUDE | _EXCLUDE */
+blackbox_filter_add(&h, "MSH");                       /* exclude: skip MSH records            */
+```
+`INCLUDE` records only listed tags; `EXCLUDE` records all but listed. The list holds up to
+`BLACKBOX_FILTER_MAX` (16) tags; status reports the mode, list size, and a `filtered` count.
+
 ## Backends
 - **NONE** — the RAM pool *is* the store (a ring; oldest evicted when full). On esp32 the pool can be
   an `RTC_NOINIT` buffer, so records survive deep sleep; dumped over USB. No flash wear.
