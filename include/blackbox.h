@@ -91,10 +91,6 @@ typedef enum {
     BLACKBOX_FLUSH_WRITE_THROUGH,   /* persist every insert immediately (durable, for debugging)  */
 } blackbox_flush_t;
 
-/* FILE rotation policy when the active file hits max_bytes. */
-#define BLACKBOX_ROTATE_BACKUP    0u    /* keep one <path>.old backup (default) — ~2× footprint    */
-#define BLACKBOX_ROTATE_OVERWRITE 1u    /* no backup, truncate the active file — ~1× footprint     */
-
 typedef struct {
     char    *pool;                  /* caller-provided RAM (static | RTC_NOINIT | heap)           */
     size_t   pool_sz;
@@ -105,7 +101,8 @@ typedef struct {
      * exceed max_bytes. 0 = unbounded on that axis. */
     uint32_t max_records;           /* cap on records kept (NONE ring)                            */
     uint32_t max_bytes;             /* cap on stored bytes (NONE) / active-file size (FILE)       */
-    uint8_t  rotate;                /* FILE at max_bytes: BLACKBOX_ROTATE_BACKUP (default)|OVERWRITE*/
+    uint8_t  generations;           /* FILE at max_bytes: keep this many rotated <path>.N backups  */
+                                    /* (0 = overwrite/no backup; N = <path>.1 .. .N, oldest dropped)*/
     const char *persist_arg;        /* FILE: path · MDS_FLASH: partition label · else NULL        */
     bool     enabled;               /* initial gate; toggle at run time via blackbox_enable()     */
 } blackbox_config_t;
@@ -364,17 +361,23 @@ int blackbox_flush(blackbox_handle_t *h) {
        tracks active-file + staged, so this fires once the pending flush would push it over. Total
        footprint stays under ~2×max_bytes (active + one backup); a rename, not a rewrite. */
     if (h->max_bytes && h->stored_bytes > h->max_bytes) {
-        if (h->cfg->rotate == BLACKBOX_ROTATE_OVERWRITE) {
-            FILE *tf = fopen(be->path, "w");    /* truncate — no backup kept (~1× footprint) */
+        const uint8_t gens = h->cfg->generations;
+        if (gens == 0) {
+            FILE *tf = fopen(be->path, "w");    /* overwrite — no backup (~1× footprint) */
             if (tf) (void)fclose(tf);
-        } else {                                /* BACKUP: active → .old (single backup, overwritten) */
-            const size_t sz = strlen(be->path) + 5;
-            char *oldp = (char *)malloc(sz);
-            if (oldp) {
-                (void)snprintf(oldp, sz, "%s.old", be->path);
-                (void)rename(be->path, oldp);
-                free(oldp);
+        } else {                                /* generational: shift .N-1→.N … .1→.2, active→.1 */
+            const size_t sz = strlen(be->path) + 6;   /* path + ".NNN" + NUL */
+            char *from = (char *)malloc(sz), *to = (char *)malloc(sz);
+            if (from && to) {
+                for (int g = (int)gens - 1; g >= 1; g--) {   /* oldest (.gens) is overwritten/dropped */
+                    (void)snprintf(from, sz, "%s.%d", be->path, g);
+                    (void)snprintf(to, sz, "%s.%d", be->path, g + 1);
+                    (void)rename(from, to);     /* ENOENT if .g absent — harmless */
+                }
+                (void)snprintf(to, sz, "%s.1", be->path);
+                (void)rename(be->path, to);     /* active → .1 */
             }
+            free(from); free(to);
         }
         h->stored_bytes = (uint32_t)h->pool_len;   /* the active file is now empty */
         h->count = blackbox__pool_lines(h);

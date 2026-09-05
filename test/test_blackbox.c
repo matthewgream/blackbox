@@ -74,20 +74,24 @@ int main(void) {
     assert(st.count == 2);                                /* only the 2 newest kept */
     printf("  bound ok (NONE kept %u of 4)\n", st.count);
 #else                                                     /* FILE — byte-bound rotation */
-    blackbox_clear(&h);
-    remove("/tmp/bb_test.csv.old");
-    blackbox_bound(&h, 0, 100);                           /* default rotate = BACKUP */
-    for (int i = 0; i < 30; i++) { evt_t eb = { (uint8_t)i, (uint8_t)i }; (void)blackbox_insert(&h, &cfg_evt, &eb); (void)blackbox_flush(&h); }
-    { FILE *of = fopen("/tmp/bb_test.csv.old", "r"); assert(of != NULL); (void)fclose(of); }  /* backup exists */
-    printf("  bound ok (FILE backup: rotated to .old)\n");
-    /* overwrite mode: no backup kept */
-    remove("/tmp/bb_test.csv.old");
-    blackbox_config_t ocfg = cfg; ocfg.rotate = BLACKBOX_ROTATE_OVERWRITE; ocfg.max_bytes = 100;
-    blackbox_handle_t oh; assert(blackbox_init(&oh, &ocfg) == 0);
-    blackbox_clear(&oh);
-    for (int i = 0; i < 30; i++) { evt_t eb = { (uint8_t)i, (uint8_t)i }; (void)blackbox_insert(&oh, &cfg_evt, &eb); (void)blackbox_flush(&oh); }
-    { FILE *nf = fopen("/tmp/bb_test.csv.old", "r"); assert(nf == NULL); }   /* overwrite → no backup */
-    printf("  bound ok (FILE overwrite: no .old kept)\n");
+    remove("/tmp/bb_test.csv.1"); remove("/tmp/bb_test.csv.2");
+    remove("/tmp/bb_test.csv.3"); remove("/tmp/bb_test.csv.4");
+    /* generational: keep 3 backups (.1 .. .3), oldest dropped */
+    blackbox_config_t gcfg = cfg; gcfg.generations = 3; gcfg.max_bytes = 60;
+    blackbox_handle_t gh; assert(blackbox_init(&gh, &gcfg) == 0); blackbox_clear(&gh);
+    for (int i = 0; i < 40; i++) { evt_t eb = { (uint8_t)i, (uint8_t)i }; (void)blackbox_insert(&gh, &cfg_evt, &eb); (void)blackbox_flush(&gh); }
+    { FILE *f1 = fopen("/tmp/bb_test.csv.1", "r"); assert(f1); (void)fclose(f1);
+      FILE *f3 = fopen("/tmp/bb_test.csv.3", "r"); assert(f3); (void)fclose(f3);
+      FILE *f4 = fopen("/tmp/bb_test.csv.4", "r"); assert(f4 == NULL); }   /* capped at 3 */
+    printf("  bound ok (FILE generations=3: .1/.2/.3 kept, .4 dropped)\n");
+    blackbox_deinit(&gh);
+    /* overwrite: generations=0 → no backup */
+    remove("/tmp/bb_test.csv.1");
+    blackbox_config_t ocfg = cfg; ocfg.generations = 0; ocfg.max_bytes = 60;
+    blackbox_handle_t oh; assert(blackbox_init(&oh, &ocfg) == 0); blackbox_clear(&oh);
+    for (int i = 0; i < 40; i++) { evt_t eb = { (uint8_t)i, (uint8_t)i }; (void)blackbox_insert(&oh, &cfg_evt, &eb); (void)blackbox_flush(&oh); }
+    { FILE *nf = fopen("/tmp/bb_test.csv.1", "r"); assert(nf == NULL); }   /* overwrite → no backup */
+    printf("  bound ok (FILE generations=0: overwrite, no backup)\n");
     blackbox_deinit(&oh);
 #endif
     blackbox_bound(&h, 0, 0);

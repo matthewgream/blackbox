@@ -312,9 +312,9 @@ Then: add more record types per device — the shared **lifecycle** record is th
   by integer compare (not strcmp). Status reports mode, list size, and a `filtered` count.
 - **Bounding (implemented, runtime):** `max_records` + `max_bytes` in the config (initial) and
   `blackbox_bound(h, records, bytes)` at run time. NONE evicts the oldest to fit; FILE past `max_bytes`
-  either keeps one `<path>.old` backup (`cfg.rotate=BLACKBOX_ROTATE_BACKUP`, default, ~2×) or overwrites
-  with no backup (`BLACKBOX_ROTATE_OVERWRITE`, ~1×) — a single backup either way, never accumulating.
-  0 = unbounded. Essential on a flash filesystem (batch + bound = less wear, capped footprint).
+  rotates generationally — `cfg.generations` backups `<path>.1 .. .N` (oldest dropped), or 0 = overwrite
+  (no backup). Footprint ~(N+1)×max_bytes. 0 on a bound axis = unbounded. Essential on a flash
+  filesystem (batch + bound = less wear, capped footprint).
 - **Status** (`blackbox_status_t` + `blackbox_status_str(st, flags, buf, n)`): enabled, persist,
   filters, count/dropped/inserted/flushes, bytes/used%/pool_sz, uptime. Renders selectively via the
   `BLACKBOX_STATUS_*` section flags. This is what the gateway's MQTT status query returns.
