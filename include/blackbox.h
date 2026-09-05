@@ -96,7 +96,11 @@ typedef struct {
     size_t   pool_sz;
     blackbox_flush_t flush;
     uint32_t flush_ms;              /* for BATCH_TIME                                             */
-    uint32_t expire_limit;          /* max stored records (0 = backend default / unbounded-ish)   */
+    /* Bound the store (initial values; change at run time with blackbox_bound()). Applied to BOTH
+     * backends: NONE evicts the oldest record; FILE rotates (active → .old) when the file would
+     * exceed max_bytes. 0 = unbounded on that axis. */
+    uint32_t max_records;           /* cap on records kept (NONE ring)                            */
+    uint32_t max_bytes;             /* cap on stored bytes (NONE) / active-file size (FILE)       */
     const char *persist_arg;        /* FILE: path · MDS_FLASH: partition label · else NULL        */
     bool     enabled;               /* initial gate; toggle at run time via blackbox_enable()     */
 } blackbox_config_t;
@@ -113,6 +117,8 @@ typedef struct {
     uint32_t flushes;               /* number of persist operations                               */
     uint32_t bytes;                 /* bytes currently stored                                     */
     uint32_t pool_sz;               /* pool capacity                                              */
+    uint32_t max_records;           /* current bound (0 = unbounded)                              */
+    uint32_t max_bytes;             /* current bound (0 = unbounded)                              */
     uint8_t  used_pct;              /* store fullness, 0..100                                      */
     uint32_t uptime_ms;             /* ms accumulated via blackbox_tick since init                */
 } blackbox_status_t;
@@ -130,6 +136,7 @@ typedef struct {
     blackbox_filter_t filter;       /* record-type include/exclude filter                         */
     size_t   pool_len;              /* bytes currently staged/stored in the pool                  */
     uint32_t count, dropped, filtered, inserted, flushes, stored_bytes;
+    uint32_t max_records, max_bytes;/* runtime bound (from config; changeable via blackbox_bound) */
     uint32_t flush_timer_ms;        /* accumulated by blackbox_tick, reset on a BATCH_TIME flush  */
     uint32_t uptime_ms;             /* accumulated by blackbox_tick, monotonic                    */
     void    *be;                    /* backend state (opaque; set by the backend at init)         */
@@ -154,7 +161,11 @@ int  blackbox_flush (blackbox_handle_t *h);
 int  blackbox_pull  (blackbox_handle_t *h, size_t *cursor, char *line, size_t n);
 
 void blackbox_clear (blackbox_handle_t *h);
-void blackbox_expire(blackbox_handle_t *h);
+void blackbox_expire(blackbox_handle_t *h);   /* re-apply the current bound now */
+
+/* Change the store bound at run time (0 = unbounded on that axis); applied immediately. */
+void blackbox_bound (blackbox_handle_t *h, uint32_t max_records, uint32_t max_bytes);
+
 bool blackbox_status(blackbox_handle_t *h, blackbox_status_t *out);
 
 /* Render selected sections of a status into buf (see BLACKBOX_STATUS_* flags; ALL for everything).
@@ -228,35 +239,57 @@ static const char *blackbox__filter_name(uint8_t m) {
     }
 }
 
+#if BLACKBOX_PERSIST != BLACKBOX_PERSIST_FILE
+/* Evict the single oldest whole line from the pool (NONE ring / bound). */
+static void blackbox__evict_oldest(blackbox_handle_t *h) {
+    if (h->pool_len == 0) return;
+    const char *nl = memchr(h->cfg->pool, '\n', h->pool_len);
+    const size_t evict = nl ? (size_t)(nl - h->cfg->pool) + 1u : h->pool_len;
+    memmove(h->cfg->pool, h->cfg->pool + evict, h->pool_len - evict);
+    h->pool_len -= evict;
+    if (h->count) h->count--;
+    h->stored_bytes -= (h->stored_bytes >= (uint32_t)evict) ? (uint32_t)evict : h->stored_bytes;
+}
+/* Enforce the record/byte bound by evicting the oldest lines (NONE). 0 on an axis = unbounded. */
+static void blackbox__enforce_bound(blackbox_handle_t *h) {
+    while (h->pool_len > 0 &&
+           ((h->max_records && h->count > h->max_records) ||
+            (h->max_bytes && h->stored_bytes > h->max_bytes)))
+        blackbox__evict_oldest(h);
+}
+#else
+/* Count whole lines currently staged in the pool (FILE — used at rotation). */
+static uint32_t blackbox__pool_lines(const blackbox_handle_t *h) {
+    uint32_t n = 0;
+    for (size_t i = 0; i < h->pool_len; i++)
+        if (h->cfg->pool[i] == '\n') n++;
+    return n;
+}
+#endif
+
 /* Append one assembled line (ln bytes, includes the trailing '\n') into the store. */
 static int blackbox__store_append(blackbox_handle_t *h, const char *line, size_t ln) {
     if (ln == 0 || ln > h->cfg->pool_sz)
         return -1;
-
 #if BLACKBOX_PERSIST == BLACKBOX_PERSIST_FILE
     if (h->pool_len + ln > h->cfg->pool_sz)     /* stage full → drain to the file first */
         if (blackbox_flush(h) != 0)
             return -1;
     if (h->pool_len + ln > h->cfg->pool_sz)     /* still no room (shouldn't happen) */
         return -1;
-    memcpy(h->cfg->pool + h->pool_len, line, ln);
-    h->pool_len += ln;
 #else /* PERSIST_NONE — the pool is a ring; evict whole oldest lines to make room */
-    while (h->pool_len + ln > h->cfg->pool_sz && h->pool_len > 0) {
-        const char *nl = memchr(h->cfg->pool, '\n', h->pool_len);
-        const size_t evict = nl ? (size_t)(nl - h->cfg->pool) + 1u : h->pool_len;
-        memmove(h->cfg->pool, h->cfg->pool + evict, h->pool_len - evict);
-        h->pool_len -= evict;
-        if (h->count) h->count--;
-        h->stored_bytes -= (h->stored_bytes >= (uint32_t)evict) ? (uint32_t)evict : h->stored_bytes;
-    }
+    while (h->pool_len + ln > h->cfg->pool_sz && h->pool_len > 0)
+        blackbox__evict_oldest(h);
     if (h->pool_len + ln > h->cfg->pool_sz)
         return -1;
+#endif
     memcpy(h->cfg->pool + h->pool_len, line, ln);
     h->pool_len += ln;
-#endif
     h->count++;
     h->stored_bytes += (uint32_t)ln;
+#if BLACKBOX_PERSIST != BLACKBOX_PERSIST_FILE
+    blackbox__enforce_bound(h);                 /* honour max_records / max_bytes */
+#endif
     return 0;
 }
 
@@ -266,6 +299,8 @@ int blackbox_init(blackbox_handle_t *h, const blackbox_config_t *cfg) {
     memset(h, 0, sizeof(*h));
     h->cfg = cfg;
     h->enabled = cfg->enabled;
+    h->max_records = cfg->max_records;
+    h->max_bytes = cfg->max_bytes;
 #if BLACKBOX_PERSIST == BLACKBOX_PERSIST_FILE
     blackbox_file_be_t *be = (blackbox_file_be_t *)calloc(1, sizeof(*be));
     if (!be) return -1;
@@ -320,6 +355,20 @@ int blackbox_flush(blackbox_handle_t *h) {
 #if BLACKBOX_PERSIST == BLACKBOX_PERSIST_FILE
     if (h->pool_len == 0) return 0;
     blackbox_file_be_t *be = (blackbox_file_be_t *)h->be;
+    /* Byte bound: rotate the active file (→ .old) before it would exceed max_bytes. stored_bytes
+       tracks active-file + staged, so this fires once the pending flush would push it over. Total
+       footprint stays under ~2×max_bytes (active + one backup); a rename, not a rewrite. */
+    if (h->max_bytes && h->stored_bytes > h->max_bytes) {
+        const size_t sz = strlen(be->path) + 5;
+        char *oldp = (char *)malloc(sz);
+        if (oldp) {
+            (void)snprintf(oldp, sz, "%s.old", be->path);
+            (void)rename(be->path, oldp);       /* active → .old (overwrites any previous .old) */
+            free(oldp);
+        }
+        h->stored_bytes = (uint32_t)h->pool_len;   /* the active file is now empty */
+        h->count = blackbox__pool_lines(h);
+    }
     FILE *f = fopen(be->path, "a");
     if (!f) return -1;
     const size_t w = fwrite(h->cfg->pool, 1, h->pool_len, f);
@@ -375,17 +424,19 @@ void blackbox_clear(blackbox_handle_t *h) {
 }
 
 void blackbox_expire(blackbox_handle_t *h) {
-    if (!h || h->cfg->expire_limit == 0) return;
-#if BLACKBOX_PERSIST != BLACKBOX_PERSIST_FILE
-    while (h->count > h->cfg->expire_limit && h->pool_len > 0) {
-        const char *nl = memchr(h->cfg->pool, '\n', h->pool_len);
-        const size_t evict = nl ? (size_t)(nl - h->cfg->pool) + 1u : h->pool_len;
-        memmove(h->cfg->pool, h->cfg->pool + evict, h->pool_len - evict);
-        h->pool_len -= evict;
-        if (h->count) h->count--;
-        h->stored_bytes -= (h->stored_bytes >= (uint32_t)evict) ? (uint32_t)evict : h->stored_bytes;
-    }
+    if (!h) return;
+#if BLACKBOX_PERSIST == BLACKBOX_PERSIST_FILE
+    (void)blackbox_flush(h);        /* flush enforces the byte bound (rotation) */
+#else
+    blackbox__enforce_bound(h);     /* evict oldest to fit max_records / max_bytes */
 #endif
+}
+
+void blackbox_bound(blackbox_handle_t *h, uint32_t max_records, uint32_t max_bytes) {
+    if (!h) return;
+    h->max_records = max_records;
+    h->max_bytes = max_bytes;
+    blackbox_expire(h);             /* apply the new bound immediately */
 }
 
 bool blackbox_status(blackbox_handle_t *h, blackbox_status_t *out) {
@@ -401,6 +452,8 @@ bool blackbox_status(blackbox_handle_t *h, blackbox_status_t *out) {
     out->flushes  = h->flushes;
     out->bytes    = h->stored_bytes;
     out->pool_sz  = (uint32_t)h->cfg->pool_sz;
+    out->max_records = h->max_records;
+    out->max_bytes   = h->max_bytes;
     out->used_pct = blackbox__used_pct(h);
     out->uptime_ms = h->uptime_ms;
     return true;
@@ -430,7 +483,7 @@ int blackbox_status_str(const blackbox_status_t *st, uint32_t flags, char *buf, 
     if (flags & BLACKBOX_STATUS_COUNTS)
         BLACKBOX__APPEND(" count=%u dropped=%u filtered=%u inserted=%u flushes=%u", (unsigned)st->count, (unsigned)st->dropped, (unsigned)st->filtered, (unsigned)st->inserted, (unsigned)st->flushes);
     if (flags & BLACKBOX_STATUS_STORAGE)
-        BLACKBOX__APPEND(" bytes=%u/%u(%u%%)", (unsigned)st->bytes, (unsigned)st->pool_sz, (unsigned)st->used_pct);
+        BLACKBOX__APPEND(" bytes=%u/%u(%u%%) bound=%urec/%ub", (unsigned)st->bytes, (unsigned)st->pool_sz, (unsigned)st->used_pct, (unsigned)st->max_records, (unsigned)st->max_bytes);
     if (flags & BLACKBOX_STATUS_TIMING)
         BLACKBOX__APPEND(" uptime=%ums", (unsigned)st->uptime_ms);
 #undef BLACKBOX__APPEND

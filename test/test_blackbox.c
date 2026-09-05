@@ -65,6 +65,26 @@ int main(void) {
     blackbox_filter_clear(&h);
     blackbox_clear(&h);
 
+    /* runtime bound: NONE evicts to max_records; FILE rotates the file by max_bytes */
+    blackbox_bound(&h, 2, 0);
+    for (int i = 0; i < 4; i++) { evt_t eb = { (uint8_t)i, 0 }; (void)blackbox_insert(&h, &cfg_evt, &eb); }
+    blackbox_status(&h, &st);
+    assert(st.max_records == 2);
+#if BLACKBOX_PERSIST != 1                                 /* NONE ring */
+    assert(st.count == 2);                                /* only the 2 newest kept */
+    printf("  bound ok (NONE kept %u of 4)\n", st.count);
+#else                                                     /* FILE — byte-bound rotation */
+    blackbox_clear(&h);
+    remove("/tmp/bb_test.csv.old");
+    blackbox_bound(&h, 0, 100);
+    for (int i = 0; i < 30; i++) { evt_t eb = { (uint8_t)i, (uint8_t)i }; (void)blackbox_insert(&h, &cfg_evt, &eb); (void)blackbox_flush(&h); }
+    FILE *of = fopen("/tmp/bb_test.csv.old", "r");
+    assert(of != NULL); (void)fclose(of);                 /* rotated → a backup exists */
+    printf("  bound ok (FILE rotated to .old, active bounded)\n");
+#endif
+    blackbox_bound(&h, 0, 0);
+    blackbox_clear(&h);
+
     blackbox_enable(&h, false);
     evt_t e2 = { 9, 999 };
     (void)blackbox_insert(&h, &cfg_evt, &e2);

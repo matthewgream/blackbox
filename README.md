@@ -80,6 +80,18 @@ blackbox_filter_add(&h, "MSH");                       /* exclude: skip MSH recor
 `INCLUDE` records only listed tags; `EXCLUDE` records all but listed. The list holds up to
 `BLACKBOX_FILTER_MAX` (16) tags; status reports the mode, list size, and a `filtered` count.
 
+## Bounding (size / count)
+Bound the store at **runtime** — initial value from the config, changeable any time via
+`blackbox_bound` — on both backends:
+```c
+blackbox_bound(&h, 1000, 0);      /* keep ≤ 1000 records (NONE evicts the oldest)        */
+blackbox_bound(&h, 0, 65536);     /* cap the file at 64 KB — rotates active → <path>.old  */
+```
+`NONE` evicts the oldest record when over `max_records`/`max_bytes`; `FILE` rotates the active file to
+`<path>.old` (one backup — a rename, not a rewrite) when it would exceed `max_bytes`. `0` on an axis =
+unbounded. On a flash filesystem this matters twice over: **batch** (don't write-through) to cut erase
+cycles, and **bound** to keep the footprint from filling the partition.
+
 ## Backends
 - **NONE** — the RAM pool *is* the store (a ring; oldest evicted when full). On esp32 the pool can be
   an `RTC_NOINIT` buffer, so records survive deep sleep; dumped over USB. No flash wear.

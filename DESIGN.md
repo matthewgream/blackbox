@@ -310,6 +310,10 @@ Then: add more record types per device — the shared **lifecycle** record is th
 - **Tag filtering (implemented):** tags are capped at `BLACKBOX_TAG_MAX` chars (default 8→uint64, or
   4→uint32) and packed into that integer, so `blackbox_filter_mode/add/remove/clear` do include/exclude
   by integer compare (not strcmp). Status reports mode, list size, and a `filtered` count.
+- **Bounding (implemented, runtime):** `max_records` + `max_bytes` in the config (initial) and
+  `blackbox_bound(h, records, bytes)` at run time. NONE evicts the oldest to fit; FILE rotates the
+  active file to `<path>.old` (one backup, a rename) past `max_bytes`. 0 = unbounded. Essential on a
+  flash filesystem (batch + bound = less wear, capped footprint).
 - **Status** (`blackbox_status_t` + `blackbox_status_str(st, flags, buf, n)`): enabled, persist,
   filters, count/dropped/inserted/flushes, bytes/used%/pool_sz, uptime. Renders selectively via the
   `BLACKBOX_STATUS_*` section flags. This is what the gateway's MQTT status query returns.
