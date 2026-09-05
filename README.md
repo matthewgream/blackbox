@@ -87,10 +87,12 @@ Bound the store at **runtime** — initial value from the config, changeable any
 blackbox_bound(&h, 1000, 0);      /* keep ≤ 1000 records (NONE evicts the oldest)        */
 blackbox_bound(&h, 0, 65536);     /* cap the file at 64 KB — rotates active → <path>.old  */
 ```
-`NONE` evicts the oldest record when over `max_records`/`max_bytes`; `FILE` rotates the active file to
-`<path>.old` (one backup — a rename, not a rewrite) when it would exceed `max_bytes`. `0` on an axis =
-unbounded. On a flash filesystem this matters twice over: **batch** (don't write-through) to cut erase
-cycles, and **bound** to keep the footprint from filling the partition.
+`NONE` evicts the oldest record when over `max_records`/`max_bytes`. `FILE`, past `max_bytes`, either
+keeps one **`<path>.old` backup** (`cfg.rotate = BLACKBOX_ROTATE_BACKUP`, the default — a rename, not a
+rewrite, ~2× footprint) or **overwrites** with no backup (`BLACKBOX_ROTATE_OVERWRITE`, ~1× footprint).
+It's a single overwritten backup either way — it never accumulates. `0` on an axis = unbounded. On a
+flash filesystem this matters twice over: **batch** (don't write-through) to cut erase cycles, and
+**bound** to cap the footprint.
 
 ## Backends
 - **NONE** — the RAM pool *is* the store (a ring; oldest evicted when full). On esp32 the pool can be

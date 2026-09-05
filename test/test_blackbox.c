@@ -76,11 +76,19 @@ int main(void) {
 #else                                                     /* FILE — byte-bound rotation */
     blackbox_clear(&h);
     remove("/tmp/bb_test.csv.old");
-    blackbox_bound(&h, 0, 100);
+    blackbox_bound(&h, 0, 100);                           /* default rotate = BACKUP */
     for (int i = 0; i < 30; i++) { evt_t eb = { (uint8_t)i, (uint8_t)i }; (void)blackbox_insert(&h, &cfg_evt, &eb); (void)blackbox_flush(&h); }
-    FILE *of = fopen("/tmp/bb_test.csv.old", "r");
-    assert(of != NULL); (void)fclose(of);                 /* rotated → a backup exists */
-    printf("  bound ok (FILE rotated to .old, active bounded)\n");
+    { FILE *of = fopen("/tmp/bb_test.csv.old", "r"); assert(of != NULL); (void)fclose(of); }  /* backup exists */
+    printf("  bound ok (FILE backup: rotated to .old)\n");
+    /* overwrite mode: no backup kept */
+    remove("/tmp/bb_test.csv.old");
+    blackbox_config_t ocfg = cfg; ocfg.rotate = BLACKBOX_ROTATE_OVERWRITE; ocfg.max_bytes = 100;
+    blackbox_handle_t oh; assert(blackbox_init(&oh, &ocfg) == 0);
+    blackbox_clear(&oh);
+    for (int i = 0; i < 30; i++) { evt_t eb = { (uint8_t)i, (uint8_t)i }; (void)blackbox_insert(&oh, &cfg_evt, &eb); (void)blackbox_flush(&oh); }
+    { FILE *nf = fopen("/tmp/bb_test.csv.old", "r"); assert(nf == NULL); }   /* overwrite → no backup */
+    printf("  bound ok (FILE overwrite: no .old kept)\n");
+    blackbox_deinit(&oh);
 #endif
     blackbox_bound(&h, 0, 0);
     blackbox_clear(&h);
