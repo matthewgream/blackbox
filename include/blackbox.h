@@ -115,6 +115,7 @@ typedef struct {
     uint32_t count;                 /* records currently stored                                   */
     uint32_t dropped;               /* records dropped (disabled, full, or encode error)          */
     uint32_t filtered;              /* records skipped by the tag filter                          */
+    uint32_t corruptions;           /* times the pool canary was found tainted (and reset)        */
     uint32_t inserted;              /* records accepted since init/clear (monotonic)              */
     uint32_t flushes;               /* number of persist operations                               */
     uint32_t bytes;                 /* bytes currently stored                                     */
@@ -136,8 +137,10 @@ typedef struct {
     const blackbox_config_t *cfg;
     bool     enabled;
     blackbox_filter_t filter;       /* record-type include/exclude filter                         */
-    size_t   pool_len;              /* bytes currently staged/stored in the pool                  */
-    uint32_t count, dropped, filtered, inserted, flushes, stored_bytes;
+    char    *pool_base;             /* record area = cfg->pool + front header (canaries at both ends)*/
+    size_t   pool_cap;              /* record capacity = pool_sz - front - back                    */
+    size_t   pool_len;              /* record bytes currently staged/stored                        */
+    uint32_t count, dropped, filtered, inserted, flushes, stored_bytes, corruptions;
     uint32_t max_records, max_bytes;/* runtime bound (from config; changeable via blackbox_bound) */
     uint32_t flush_timer_ms;        /* accumulated by blackbox_tick, reset on a BATCH_TIME flush  */
     uint32_t uptime_ms;             /* accumulated by blackbox_tick, monotonic                    */
@@ -176,6 +179,10 @@ int  blackbox_status_str(const blackbox_status_t *st, uint32_t flags, char *buf,
 
 void blackbox_enable(blackbox_handle_t *h, bool on);
 
+/* Check the pool's front+back canaries; if tainted, reset the pool fresh and count a corruption.
+ * Returns true if the pool was intact. blackbox_tick calls this periodically. */
+bool blackbox_validate(blackbox_handle_t *h);
+
 /* Record-type filter: pack `tag` (≤ BLACKBOX_TAG_MAX chars) and include/exclude it; matching on
  * insert is an integer compare. Default mode is OFF (record everything). */
 void blackbox_filter_mode  (blackbox_handle_t *h, uint8_t mode);    /* BLACKBOX_FILTER_*   */
@@ -213,9 +220,34 @@ void blackbox_deinit(blackbox_handle_t *h);
 typedef struct { const char *path; } blackbox_file_be_t;
 #endif
 
+/* Pool canaries: a survivability header at the front and a guard word at the back. Both hold the
+ * magic; the front also holds the record length. Purposes: (1) on init, an intact pool that survived
+ * (RTC across sleep/fault) is ADOPTED, a garbage/first-boot pool is started fresh; (2) the front+back
+ * magics are stack-canary-style guard bands — an over/under-run taints one and blackbox_validate()
+ * catches it. Works on any platform. */
+#define BLACKBOX_POOL_MAGIC  0xB1ACB0C5u
+#define BLACKBOX_POOL_FRONT  8u    /* magic(4) + len(4) */
+#define BLACKBOX_POOL_BACK   4u    /* magic(4)          */
+
+static uint32_t blackbox__rd32(const char *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static void     blackbox__wr32(char *p, uint32_t v) { memcpy(p, &v, 4); }
+
+static bool blackbox__pool_intact(const blackbox_handle_t *h) {
+    return blackbox__rd32(h->cfg->pool) == BLACKBOX_POOL_MAGIC
+        && blackbox__rd32(h->cfg->pool + h->cfg->pool_sz - BLACKBOX_POOL_BACK) == BLACKBOX_POOL_MAGIC;
+}
+static void blackbox__pool_stamp(blackbox_handle_t *h) {   /* (re)write both canaries + len — fresh */
+    blackbox__wr32(h->cfg->pool, BLACKBOX_POOL_MAGIC);
+    blackbox__wr32(h->cfg->pool + 4, (uint32_t)h->pool_len);
+    blackbox__wr32(h->cfg->pool + h->cfg->pool_sz - BLACKBOX_POOL_BACK, BLACKBOX_POOL_MAGIC);
+}
+static void blackbox__pool_sync(blackbox_handle_t *h) {    /* update len only (leave canaries intact for taint detection) */
+    blackbox__wr32(h->cfg->pool + 4, (uint32_t)h->pool_len);
+}
+
 static uint8_t blackbox__used_pct(const blackbox_handle_t *h) {
-    if (!h->cfg->pool_sz) return 0;
-    return (uint8_t)((h->pool_len * 100u) / h->cfg->pool_sz);
+    if (!h->pool_cap) return 0;
+    return (uint8_t)((h->pool_len * 100u) / h->pool_cap);
 }
 
 blackbox_tag_t blackbox_tag_pack(const char *tag) {
@@ -241,16 +273,25 @@ static const char *blackbox__filter_name(uint8_t m) {
     }
 }
 
+/* Count whole lines currently in the record area (adopt + FILE rotation). */
+static uint32_t blackbox__pool_lines(const blackbox_handle_t *h) {
+    uint32_t n = 0;
+    for (size_t i = 0; i < h->pool_len; i++)
+        if (h->pool_base[i] == '\n') n++;
+    return n;
+}
+
 #if BLACKBOX_PERSIST != BLACKBOX_PERSIST_FILE
-/* Evict the single oldest whole line from the pool (NONE ring / bound). */
+/* Evict the single oldest whole line from the record area (NONE ring / bound). */
 static void blackbox__evict_oldest(blackbox_handle_t *h) {
     if (h->pool_len == 0) return;
-    const char *nl = memchr(h->cfg->pool, '\n', h->pool_len);
-    const size_t evict = nl ? (size_t)(nl - h->cfg->pool) + 1u : h->pool_len;
-    memmove(h->cfg->pool, h->cfg->pool + evict, h->pool_len - evict);
+    const char *nl = memchr(h->pool_base, '\n', h->pool_len);
+    const size_t evict = nl ? (size_t)(nl - h->pool_base) + 1u : h->pool_len;
+    memmove(h->pool_base, h->pool_base + evict, h->pool_len - evict);
     h->pool_len -= evict;
     if (h->count) h->count--;
     h->stored_bytes -= (h->stored_bytes >= (uint32_t)evict) ? (uint32_t)evict : h->stored_bytes;
+    blackbox__pool_sync(h);
 }
 /* Enforce the record/byte bound by evicting the oldest lines (NONE). 0 on an axis = unbounded. */
 static void blackbox__enforce_bound(blackbox_handle_t *h) {
@@ -259,50 +300,45 @@ static void blackbox__enforce_bound(blackbox_handle_t *h) {
             (h->max_bytes && h->stored_bytes > h->max_bytes)))
         blackbox__evict_oldest(h);
 }
-#else
-/* Count whole lines currently staged in the pool (FILE — used at rotation). */
-static uint32_t blackbox__pool_lines(const blackbox_handle_t *h) {
-    uint32_t n = 0;
-    for (size_t i = 0; i < h->pool_len; i++)
-        if (h->cfg->pool[i] == '\n') n++;
-    return n;
-}
 #endif
 
 /* Append one assembled line (ln bytes, includes the trailing '\n') into the store. */
 static int blackbox__store_append(blackbox_handle_t *h, const char *line, size_t ln) {
-    if (ln == 0 || ln > h->cfg->pool_sz)
+    if (ln == 0 || ln > h->pool_cap)
         return -1;
 #if BLACKBOX_PERSIST == BLACKBOX_PERSIST_FILE
-    if (h->pool_len + ln > h->cfg->pool_sz)     /* stage full → drain to the file first */
+    if (h->pool_len + ln > h->pool_cap)         /* stage full → drain to the file first */
         if (blackbox_flush(h) != 0)
             return -1;
-    if (h->pool_len + ln > h->cfg->pool_sz)     /* still no room (shouldn't happen) */
+    if (h->pool_len + ln > h->pool_cap)         /* still no room (shouldn't happen) */
         return -1;
-#else /* PERSIST_NONE — the pool is a ring; evict whole oldest lines to make room */
-    while (h->pool_len + ln > h->cfg->pool_sz && h->pool_len > 0)
+#else /* PERSIST_NONE — the record area is a ring; evict whole oldest lines to make room */
+    while (h->pool_len + ln > h->pool_cap && h->pool_len > 0)
         blackbox__evict_oldest(h);
-    if (h->pool_len + ln > h->cfg->pool_sz)
+    if (h->pool_len + ln > h->pool_cap)
         return -1;
 #endif
-    memcpy(h->cfg->pool + h->pool_len, line, ln);
+    memcpy(h->pool_base + h->pool_len, line, ln);
     h->pool_len += ln;
     h->count++;
     h->stored_bytes += (uint32_t)ln;
 #if BLACKBOX_PERSIST != BLACKBOX_PERSIST_FILE
     blackbox__enforce_bound(h);                 /* honour max_records / max_bytes */
 #endif
+    blackbox__pool_sync(h);
     return 0;
 }
 
 int blackbox_init(blackbox_handle_t *h, const blackbox_config_t *cfg) {
-    if (!h || !cfg || !cfg->pool || cfg->pool_sz < BLACKBOX_LINE_MAX)
+    if (!h || !cfg || !cfg->pool || cfg->pool_sz < BLACKBOX_LINE_MAX + BLACKBOX_POOL_FRONT + BLACKBOX_POOL_BACK)
         return -1;
     memset(h, 0, sizeof(*h));
     h->cfg = cfg;
     h->enabled = cfg->enabled;
     h->max_records = cfg->max_records;
     h->max_bytes = cfg->max_bytes;
+    h->pool_base = cfg->pool + BLACKBOX_POOL_FRONT;
+    h->pool_cap = cfg->pool_sz - BLACKBOX_POOL_FRONT - BLACKBOX_POOL_BACK;
 #if BLACKBOX_PERSIST == BLACKBOX_PERSIST_FILE
     blackbox_file_be_t *be = (blackbox_file_be_t *)calloc(1, sizeof(*be));
     if (!be) return -1;
@@ -312,6 +348,22 @@ int blackbox_init(blackbox_handle_t *h, const blackbox_config_t *cfg) {
     (void)fclose(f);
     h->be = be;
 #endif
+    /* Adopt a surviving pool (intact canaries — e.g. RTC RAM across deep sleep / a fault), else
+     * start fresh (normal RAM boots to garbage → canaries don't match → fresh). */
+    if (blackbox__pool_intact(h)) {
+        const uint32_t len = blackbox__rd32(cfg->pool + 4);
+        if ((size_t)len <= h->pool_cap) {
+            h->pool_len = len;
+            h->count += blackbox__pool_lines(h);
+            h->stored_bytes += (uint32_t)h->pool_len;
+        } else {
+            h->pool_len = 0;
+            blackbox__pool_stamp(h);
+        }
+    } else {
+        h->pool_len = 0;
+        blackbox__pool_stamp(h);
+    }
     return 0;
 }
 
@@ -340,8 +392,22 @@ int blackbox_insert(blackbox_handle_t *h, const blackbox_struct_config_t *sc, co
     return 0;
 }
 
+bool blackbox_validate(blackbox_handle_t *h) {
+    if (!h) return false;
+    if (blackbox__pool_intact(h)) return true;
+    /* A guard band was trampled — buffer over/under-run, or RAM corruption. Don't trust the
+     * contents: reset to a clean, freshly-stamped pool and count the event. */
+    h->corruptions++;
+    h->pool_len = 0;
+    h->count = 0;
+    h->stored_bytes = 0;
+    blackbox__pool_stamp(h);
+    return false;
+}
+
 void blackbox_tick(blackbox_handle_t *h, uint32_t dt_ms) {
     if (!h) return;
+    (void)blackbox_validate(h);     /* guard-band taint check — cheap: two 4-byte reads */
     h->uptime_ms += dt_ms;
     if (h->cfg->flush == BLACKBOX_FLUSH_BATCH_TIME && h->cfg->flush_ms) {
         h->flush_timer_ms += dt_ms;
@@ -384,12 +450,13 @@ int blackbox_flush(blackbox_handle_t *h) {
     }
     FILE *f = fopen(be->path, "a");
     if (!f) return -1;
-    const size_t w = fwrite(h->cfg->pool, 1, h->pool_len, f);
+    const size_t w = fwrite(h->pool_base, 1, h->pool_len, f);
     (void)fflush(f);
     (void)fclose(f);
     if (w != h->pool_len) return -1;
     h->pool_len = 0;                            /* staged bytes are now durable in the file */
     h->flushes++;
+    blackbox__pool_sync(h);
 #else
     (void)h;                                    /* PERSIST_NONE — the pool already IS the store */
 #endif
@@ -410,7 +477,7 @@ int blackbox_pull(blackbox_handle_t *h, size_t *cursor, char *line, size_t n) {
     (void)fclose(f);
 #else
     if (*cursor >= h->pool_len) return 0;
-    const char *base = h->cfg->pool + *cursor;
+    const char *base = h->pool_base + *cursor;
     const size_t left = h->pool_len - *cursor;
     const char *nl = memchr(base, '\n', left);
     size_t ll = nl ? (size_t)(nl - base) + 1u : left;
@@ -429,6 +496,7 @@ void blackbox_clear(blackbox_handle_t *h) {
     h->pool_len = 0;
     h->count = 0;
     h->stored_bytes = 0;
+    blackbox__pool_sync(h);
 #if BLACKBOX_PERSIST == BLACKBOX_PERSIST_FILE
     blackbox_file_be_t *be = (blackbox_file_be_t *)h->be;
     FILE *f = fopen(be->path, "w");             /* truncate */
@@ -463,8 +531,9 @@ bool blackbox_status(blackbox_handle_t *h, blackbox_status_t *out) {
     out->filtered     = h->filtered;
     out->inserted     = h->inserted;
     out->flushes  = h->flushes;
+    out->corruptions = h->corruptions;
     out->bytes    = h->stored_bytes;
-    out->pool_sz  = (uint32_t)h->cfg->pool_sz;
+    out->pool_sz  = (uint32_t)h->pool_cap;      /* usable record capacity (excludes canary bands) */
     out->max_records = h->max_records;
     out->max_bytes   = h->max_bytes;
     out->used_pct = blackbox__used_pct(h);
@@ -494,7 +563,7 @@ int blackbox_status_str(const blackbox_status_t *st, uint32_t flags, char *buf, 
     if (flags & BLACKBOX_STATUS_STATE)
         BLACKBOX__APPEND(" enabled=%d persist=%s filter=%s(%u)", st->enabled ? 1 : 0, blackbox__persist_name(st->persist), blackbox__filter_name(st->filter_mode), (unsigned)st->filter_count);
     if (flags & BLACKBOX_STATUS_COUNTS)
-        BLACKBOX__APPEND(" count=%u dropped=%u filtered=%u inserted=%u flushes=%u", (unsigned)st->count, (unsigned)st->dropped, (unsigned)st->filtered, (unsigned)st->inserted, (unsigned)st->flushes);
+        BLACKBOX__APPEND(" count=%u dropped=%u filtered=%u inserted=%u flushes=%u corruptions=%u", (unsigned)st->count, (unsigned)st->dropped, (unsigned)st->filtered, (unsigned)st->inserted, (unsigned)st->flushes, (unsigned)st->corruptions);
     if (flags & BLACKBOX_STATUS_STORAGE)
         BLACKBOX__APPEND(" bytes=%u/%u(%u%%) bound=%urec/%ub", (unsigned)st->bytes, (unsigned)st->pool_sz, (unsigned)st->used_pct, (unsigned)st->max_records, (unsigned)st->max_bytes);
     if (flags & BLACKBOX_STATUS_TIMING)

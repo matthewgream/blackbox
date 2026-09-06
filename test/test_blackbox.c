@@ -121,6 +121,37 @@ int main(void) {
     printf("  default-disabled ok\n");
     blackbox_deinit(&h2);
 
+    /* pool guard-band canaries: taint detection + (NONE) survivable adoption over the same buffer */
+    {
+        static char cpool[256];
+        blackbox_config_t ccfg = cfg;
+        ccfg.pool = cpool; ccfg.pool_sz = sizeof cpool; ccfg.enabled = true;
+        blackbox_handle_t ch;
+        assert(blackbox_init(&ch, &ccfg) == 0);
+        blackbox_clear(&ch);
+        for (int i = 0; i < 3; i++) { evt_t e = { (uint8_t)i, (uint16_t)i }; assert(blackbox_insert(&ch, &cfg_evt, &e) == 0); }
+        blackbox_status(&ch, &st);
+        assert(st.count == 3 && st.corruptions == 0);
+
+        ((unsigned char *)cpool)[sizeof(cpool) - 1] ^= 0xFFu;   /* trample the back guard band */
+        assert(blackbox_validate(&ch) == false);           /* validate must catch it, reset, count it */
+        blackbox_status(&ch, &st);
+        assert(st.corruptions == 1 && st.count == 0);
+        assert(blackbox_validate(&ch) == true);            /* re-stamped → clean again */
+        printf("  canary taint ok (corruptions=%u, reset to count=%u)\n", st.corruptions, st.count);
+
+#if BLACKBOX_PERSIST != 1                                   /* NONE keeps records in the pool itself */
+        for (int i = 0; i < 4; i++) { evt_t e = { (uint8_t)i, (uint16_t)i }; assert(blackbox_insert(&ch, &cfg_evt, &e) == 0); }
+        blackbox_handle_t ch2;
+        assert(blackbox_init(&ch2, &ccfg) == 0);            /* re-init over the SAME buffer (as RTC survives a reboot) — no clear */
+        blackbox_status(&ch2, &st);
+        assert(st.count == 4);                              /* intact canaries → adopt, don't start fresh */
+        printf("  canary adopt ok (recovered %u records from surviving pool)\n", st.count);
+        blackbox_deinit(&ch2);
+#endif
+        blackbox_deinit(&ch);
+    }
+
     blackbox_deinit(&h);
     printf("  OK\n");
     return 0;

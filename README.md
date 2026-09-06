@@ -99,5 +99,18 @@ to cut erase cycles, and **bound** to cap the footprint.
 - **FILE** — pool stages, `flush` appends to a file (host).
 - **ESP_FLASH** — circular append-log in a dedicated esp32 flash partition. *Planned (P3).*
 
+## Pool integrity & survivability
+The pool carries **guard-band canaries** — a magic + staged-length header at the front and a magic at
+the back — regardless of backend or platform. They serve two ends:
+- **Survivable adoption.** On `blackbox_init`, if both canaries are intact the pool is *adopted*
+  (existing records kept) rather than wiped. Give the recorder an `RTC_NOINIT` buffer (esp32) and its
+  records survive deep sleep or a fault-reset; a normal-RAM pool boots to garbage, the canaries don't
+  match, and it starts fresh — no flag needed.
+- **Taint detection.** `blackbox_validate(&h)` checks both bands; `blackbox_tick` calls it every tick
+  (two 4-byte reads). A trampled band (buffer over/under-run, wild write) is caught — the pool is reset
+  to a clean state and `status.corruptions` is incremented. Stack-canary-style protection for the store.
+The bands cost `BLACKBOX_POOL_FRONT + BLACKBOX_POOL_BACK` (12) bytes of the pool; `used%` and the
+reported pool size are the usable record capacity, net of them.
+
 ## License
 CC BY-NC-SA 4.0 (see [LICENSE](LICENSE)).

@@ -203,6 +203,14 @@ which is exactly what specialised debugging wants. Normal operation batches (`BA
 **Tier 1 — RAM pool** (where `insert` stages; the only store in `PERSIST_NONE`): `STATIC n` · `DYNAMIC`
 · `EXTERN ptr` (project RTC_NOINIT buffer → survives deep sleep, accumulates across wakes).
 
+*Pool guard bands (all backends/platforms).* The pool is framed by canaries — a `{magic, staged-len}`
+header at the front and a `magic` at the back. On `init`, intact bands ⇒ **adopt** the pool (an
+`RTC_NOINIT` buffer's records survive sleep/fault-reset); mismatched ⇒ start fresh (normal RAM = boot
+garbage, so no flag is needed to tell the two apart). `blackbox_validate` (called every `tick`) checks
+both bands: a trampled one — over/under-run, wild write — resets the pool and bumps `status.corruptions`.
+Stack-canary-style protection over the record store. Cost: `FRONT+BACK` (12) bytes; `used%` / reported
+pool size are net of them.
+
 **Tier 2 — persistent** (one, compile-selected):
 - **`FILE`** (host) — `fopen("a")`/`fwrite`/`fgets`; expire = rotate/delete by size or **mtime**.
 - **`ESP_FLASH`** (esp32, bundled, gated) — circular append-log in a **dedicated `diag` partition**
@@ -316,8 +324,11 @@ Then: add more record types per device — the shared **lifecycle** record is th
   (no backup). Footprint ~(N+1)×max_bytes. 0 on a bound axis = unbounded. Essential on a flash
   filesystem (batch + bound = less wear, capped footprint).
 - **Status** (`blackbox_status_t` + `blackbox_status_str(st, flags, buf, n)`): enabled, persist,
-  filters, count/dropped/inserted/flushes, bytes/used%/pool_sz, uptime. Renders selectively via the
-  `BLACKBOX_STATUS_*` section flags. This is what the gateway's MQTT status query returns.
+  filters, count/dropped/inserted/flushes/corruptions, bytes/used%/pool_sz, uptime. Renders selectively
+  via the `BLACKBOX_STATUS_*` section flags. This is what the gateway's MQTT status query returns.
+- **Pool canaries (implemented, all backends):** front `{magic, staged-len}` + back `{magic}` guard
+  bands. `init` adopts an intact pool (RTC survival) or starts fresh; `blackbox_validate` (called by
+  `tick`) catches a trampled band, resets the pool, and counts it in `status.corruptions`.
 - **csv2json tag→struct mapping:** an `// @blackbox tag=LC` annotation above each record struct; the
   struct field names become the JSON keys. Fields must be declared in CSV-column (encoder) order.
 - **`blackbox_tick(h, dt_ms)`** drives `BATCH_TIME` flush and accrues `uptime_ms`.
