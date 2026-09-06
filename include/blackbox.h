@@ -9,7 +9,7 @@
  * See DESIGN.md. Configure with #defines BEFORE including this header (typically from a project
  * adapter, e.g. iotdata's iotdata_blackbox.h):
  *
- *   BLACKBOX_PERSIST   BLACKBOX_PERSIST_{NONE|FILE|MDS_FLASH|CUSTOM}   (default NONE)
+ *   BLACKBOX_PERSIST   BLACKBOX_PERSIST_{NONE|FILE|ESP_FLASH|CUSTOM}   (default NONE)
  *   BLACKBOX_CLOCK     name of  int fn(char *out, size_t n)  writing the clock column  (required)
  *   BLACKBOX_COMPRESS  BLACKBOX_COMPRESS_NONE                          (dormant hook, default NONE)
  *
@@ -26,7 +26,7 @@
 
 #define BLACKBOX_PERSIST_NONE       0   /* the RAM pool IS the store (a ring); flush is a no-op   */
 #define BLACKBOX_PERSIST_FILE       1   /* pool stages, flush appends to a file (host)            */
-#define BLACKBOX_PERSIST_MDS_FLASH  2   /* pool stages, flush appends to a flash partition (esp32)*/
+#define BLACKBOX_PERSIST_ESP_FLASH  2   /* pool stages, flush appends to a flash partition (esp32)*/
 #define BLACKBOX_PERSIST_CUSTOM     3   /* project supplies the ops                               */
 #ifndef BLACKBOX_PERSIST
 #define BLACKBOX_PERSIST BLACKBOX_PERSIST_NONE
@@ -103,7 +103,7 @@ typedef struct {
     uint32_t max_bytes;             /* cap on stored bytes (NONE) / active-file size (FILE)       */
     uint8_t  generations;           /* FILE at max_bytes: keep this many rotated <path>.N backups  */
                                     /* (0 = overwrite/no backup; N = <path>.1 .. .N, oldest dropped)*/
-    const char *persist_arg;        /* FILE: path · MDS_FLASH: partition label · else NULL        */
+    const char *persist_arg;        /* FILE: path · ESP_FLASH: partition label · else NULL        */
     bool     enabled;               /* initial gate; toggle at run time via blackbox_enable()     */
 } blackbox_config_t;
 
@@ -202,8 +202,8 @@ void blackbox_deinit(blackbox_handle_t *h);
 #include <stdio.h>
 #include <stdlib.h>
 
-#if BLACKBOX_PERSIST == BLACKBOX_PERSIST_MDS_FLASH
-#error "BLACKBOX_PERSIST_MDS_FLASH backend is not implemented yet (P3) — use PERSIST_NONE (RTC pool) or PERSIST_FILE"
+#if BLACKBOX_PERSIST == BLACKBOX_PERSIST_ESP_FLASH
+#error "BLACKBOX_PERSIST_ESP_FLASH backend is not implemented yet (P3) — use PERSIST_NONE (RTC pool) or PERSIST_FILE"
 #endif
 #if BLACKBOX_PERSIST == BLACKBOX_PERSIST_CUSTOM
 #error "BLACKBOX_PERSIST_CUSTOM backend is not wired yet"
@@ -476,7 +476,7 @@ static const char *blackbox__persist_name(int p) {
     switch (p) {
     case BLACKBOX_PERSIST_NONE:      return "none";
     case BLACKBOX_PERSIST_FILE:      return "file";
-    case BLACKBOX_PERSIST_MDS_FLASH: return "mds-flash";
+    case BLACKBOX_PERSIST_ESP_FLASH: return "esp-flash";
     case BLACKBOX_PERSIST_CUSTOM:    return "custom";
     default:                         return "?";
     }

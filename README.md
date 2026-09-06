@@ -21,7 +21,7 @@ blackbox is a **single-header** library. Configure with `#define`s **before** in
 **one** translation unit also define `BLACKBOX_IMPLEMENTATION` (typically the app's unity TU — a
 project adapter does this):
 ```c
-#define BLACKBOX_PERSIST         BLACKBOX_PERSIST_FILE   /* NONE | FILE | MDS_FLASH(esp32,P3) | CUSTOM */
+#define BLACKBOX_PERSIST         BLACKBOX_PERSIST_FILE   /* NONE | FILE | ESP_FLASH(esp32,P3) | CUSTOM */
 #define BLACKBOX_CLOCK           my_clock                /* int my_clock(char *out, size_t n)          */
 #define BLACKBOX_IMPLEMENTATION                          /* in ONE TU only                             */
 #include "blackbox.h"
@@ -97,7 +97,7 @@ to cut erase cycles, and **bound** to cap the footprint.
 - **NONE** — the RAM pool *is* the store (a ring; oldest evicted when full). On esp32 the pool can be
   an `RTC_NOINIT` buffer, so records survive deep sleep; dumped over USB. No flash wear.
 - **FILE** — pool stages, `flush` appends to a file (host).
-- **MDS_FLASH** — circular append-log in a dedicated esp32 flash partition. *Planned (P3).*
+- **ESP_FLASH** — circular append-log in a dedicated esp32 flash partition. *Planned (P3).*
 
 ## License
 CC BY-NC-SA 4.0 (see [LICENSE](LICENSE)).

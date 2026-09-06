@@ -13,7 +13,7 @@ collectors, viewers — parked, §11). Storage is compact CSV; JSON appears only
 off-device.
 
 *iotdata is one consumer.* Its adapter `iotdata-common/include/iotdata_blackbox.h` provides only the
-**backend + clock commonality** (esp32 → MDS-flash partition, linux → file; the iotdata clock
+**backend + clock commonality** (esp32 → esp-flash partition, linux → file; the iotdata clock
 convention) and `#include`s blackbox. It does **not** define records — each project (relay, gateway,
 sensor, sds, tsa) defines its own, because what each records differs. The journal **complements**
 `m_datastore` (the NVS key/value **counter** store) — a project can record a counter snapshot.
@@ -32,7 +32,7 @@ Status: **design, no code written yet.** Repo name `blackbox`; macro prefix `BLA
     • stamp    → "tag,clock,payload\n"   (clock via the config's clock hook)
     • pool     → RAM pool            ┐ tier (1): static | dynamic | extern (RTC_NOINIT)
     • flush    pool lines → persist.write   (plain CSV lines by default; compress only if enabled)
-                                     ┘ tier (2): file | mds-flash | custom | none
+                                     ┘ tier (2): file | esp-flash | custom | none
     • pull/clear/expire/status/enable   (pull returns RAW CSV lines — no struct decode in C)
 ```
 
@@ -50,13 +50,13 @@ Status: **design, no code written yet.** Repo name `blackbox`; macro prefix `BLA
 iotdata-depend/blackbox/                    PUBLIC · generic · zero iotdata knowledge
   include/ src/    the C recorder + bundled backends:
                      pool:    static | dynamic | extern
-                     persist: none | file(POSIX) | mds-flash(esp-idf, compile-gated) | custom
+                     persist: none | file(POSIX) | esp-flash(esp-idf, compile-gated) | custom
                      compress:none | heatshrink | custom
   js/csv2json      JS module (+ thin CLI): reads a record header → converts CSV records to JSON
   (delivery — mqtt bridges, collectors, viewers — deliberately OUT for now)
         ▲  #include + compile-time config
 iotdata-common/include/iotdata_blackbox.h   iotdata ADAPTER = backends + sizes + clock + 1 common record
-  • #if ESP_PLATFORM → persist = MDS-flash("diag"),  pool = RTC RAM (extern);   default SIZES here
+  • #if ESP_PLATFORM → persist = esp-flash("diag"),  pool = RTC RAM (extern);   default SIZES here
     #elif __linux__  → persist = FILE,                pool = heap RAM;            default SIZES here
     (all guarded by #ifndef → a project can override a backend/size before including)
   • supplies the iotdata clock convention (esp32 seq:up_ms / linux epoch ms)
@@ -158,7 +158,7 @@ blackbox_deinit(&h);
   (rare, batched) — the flash-wear lever. Flush triggers (config): pool-full · timed · pre-deep-sleep
   · manual. Sensors flush pre-sleep + pool-full; relay timed/size.
 - **Expire has no wall clock on the ESP32s** → on-device it is **count/size** based (evict lowest
-  `seq` when the log laps — implicit on the MDS append-log, §6). Age-based expiry only on the host
+  `seq` when the log laps — implicit on the esp-flash append-log, §6). Age-based expiry only on the host
   (file rotation by mtime). Same call; the backend decides.
 
 ---
@@ -171,8 +171,8 @@ never links): the backend, the compressor, the clock, the pool kind, the expire 
 
 ```c
 /* compile-time — unused code never links */
-#define BLACKBOX_PERSIST   BLACKBOX_PERSIST_MDS_FLASH   /* | _FILE | _CUSTOM | _NONE  */
-#define BLACKBOX_MDS_PART  "diag"
+#define BLACKBOX_PERSIST   BLACKBOX_PERSIST_ESP_FLASH   /* | _FILE | _CUSTOM | _NONE  */
+#define BLACKBOX_ESP_PART  "diag"
 #define BLACKBOX_POOL      BLACKBOX_POOL_EXTERN          /* | _STATIC(n) | _DYNAMIC    */
 #define BLACKBOX_CLOCK     iotdata_bb_clock              /* clock hook (§7)            */
 #define BLACKBOX_EXPIRE    BLACKBOX_EXPIRE_COUNT         /* | _BYTES | _AGE            */
@@ -205,12 +205,12 @@ which is exactly what specialised debugging wants. Normal operation batches (`BA
 
 **Tier 2 — persistent** (one, compile-selected):
 - **`FILE`** (host) — `fopen("a")`/`fwrite`/`fgets`; expire = rotate/delete by size or **mtime**.
-- **`MDS_FLASH`** (esp32, bundled, gated) — circular append-log in a **dedicated `diag` partition**
+- **`ESP_FLASH`** (esp32, bundled, gated) — circular append-log in a **dedicated `diag` partition**
   (`type=data, subtype=0x40`), record = a length-framed CSV line (`[u16 len][payload]`; a `flags` byte
   is added only when `BLACKBOX_COMPRESS` is on, marking a compressed block). Append forward; crossing a
   4 KB sector erases the next sector first → **evicts oldest → expiry-by-size is free.** Write cursor
   in RTC RAM + occasional flash checkpoint; recovered by scan on boot if stale. Batched appends + one
-  erase per lap ⇒ negligible wear. It is the **log mode** of the MDS family, in its **own partition,
+  erase per lap ⇒ negligible wear. It is the **log mode** of the blackbox flash family, in its **own partition,
   decoupled from the NVS counter store** — two partitions, two failure domains. Default (uncompressed)
   a raw partition dump is **human-readable CSV**.
 - **`CUSTOM`** — project supplies the ops. **`NONE`** — RAM-pool-only.
@@ -258,8 +258,8 @@ Bulk retrieval stays on **USB-JTAG** (`DIAG DUMP`); the 2400 bps mesh carries on
 | device | pool (tier 1) | persist (tier 2) | flush | compress | expire |
 |--------|---------------|------------------|-------|----------|--------|
 | **gateway** (linux) | heap | FILE + rotate | TIME | gzip-on-rotate | AGE/size |
-| **relay** (esp32, always-on) | small EXTERN(RTC) | MDS_FLASH | SIZE/TIME | on | COUNT/size |
-| **sensor** (esp32, deep-sleep) | EXTERN(RTC), accumulates | MDS_FLASH | PRESLEEP + pool-full | on | COUNT/size |
+| **relay** (esp32, always-on) | small EXTERN(RTC) | ESP_FLASH | SIZE/TIME | on | COUNT/size |
+| **sensor** (esp32, deep-sleep) | EXTERN(RTC), accumulates | ESP_FLASH | PRESLEEP + pool-full | on | COUNT/size |
 | **simulator** | heap | NONE / stdout | TIME | off | — |
 
 Same API + descriptors everywhere; only `config` + the `#define`s differ.
@@ -269,9 +269,9 @@ Same API + descriptors everywhere; only `config` + the `#define`s differ.
 ## 10. Rollout & build plan
 
 **Pieces & responsibilities**
-1. **`iotdata-depend/blackbox`** (public) — the C recorder + the MDS esp32 backend + `csv2json`.
+1. **`iotdata-depend/blackbox`** (public) — the C recorder + the esp-flash esp32 backend + `csv2json`.
 2. **`iotdata-common/include/iotdata_blackbox.h`** — platform backends + pool + **sizes** (esp32:
-   MDS-flash + RTC pool; linux: file + heap pool) + the iotdata clock, and the one common
+   esp-flash + RTC pool; linux: file + heap pool) + the iotdata clock, and the one common
    **lifecycle** record (start/stop/…).
 3. **Each project** — a header/section that: `#include`s the adapter; declares its **domain record
    structs + encoders/decoders + descriptors**; holds **init/term** (`blackbox_init` with the
@@ -286,11 +286,11 @@ Then: add more record types per device — the shared **lifecycle** record is th
 
 **Phases**
 - **P1 — prove the seam.** library (`init/insert/tick/flush/pull` + `POOL_STATIC` + `FILE` backend +
-  `MDS_FLASH` RAM-stub) + `iotdata_blackbox.h` (with the lifecycle record). Gateway records lifecycle
+  `ESP_FLASH` RAM-stub) + `iotdata_blackbox.h` (with the lifecycle record). Gateway records lifecycle
   + a stat to a CSV file; relay records lifecycle + a stat. `csv2json` turns the file into JSON.
 - **P2 — MANAGE + gateway bridge.** `DIAG_ENABLE/DISABLE/CLEAR/DUMP` (0x20) on the relay; gateway CSV
   command bridge to MQTT.
-- **P3 — real flash + retrieval.** flesh out `MDS_FLASH` (partition, wraparound, recovery) +
+- **P3 — real flash + retrieval.** flesh out `ESP_FLASH` (partition, wraparound, recovery) +
   `DIAG_READ` recent-N over mesh + USB `DIAG DUMP`. (compression still deferred.)
 - **P4 — later / out of scope now.** delivery upstream; collectors/viewers; CSV→JSON in the flow.
 
@@ -305,7 +305,7 @@ Then: add more record types per device — the shared **lifecycle** record is th
 
 ## 12. P1 implementation notes (this repo)
 - **Backends implemented:** `NONE` (pool-as-ring; on esp32 an `RTC_NOINIT` pool → survives deep
-  sleep) and `FILE` (host). `MDS_FLASH` and `CUSTOM` `#error` for now (P3) so a misconfig fails loud.
+  sleep) and `FILE` (host). `ESP_FLASH` and `CUSTOM` `#error` for now (P3) so a misconfig fails loud.
 - **Default is DISABLED** — `blackbox_enable(h, true)` to opt in.
 - **Tag filtering (implemented):** tags are capped at `BLACKBOX_TAG_MAX` chars (default 8→uint64, or
   4→uint32) and packed into that integer, so `blackbox_filter_mode/add/remove/clear` do include/exclude
