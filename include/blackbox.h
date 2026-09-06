@@ -209,9 +209,6 @@ void blackbox_deinit(blackbox_handle_t *h);
 #include <stdio.h>
 #include <stdlib.h>
 
-#if BLACKBOX_PERSIST == BLACKBOX_PERSIST_ESP_FLASH
-#error "BLACKBOX_PERSIST_ESP_FLASH backend is not implemented yet (P3) — use PERSIST_NONE (RTC pool) or PERSIST_FILE"
-#endif
 #if BLACKBOX_PERSIST == BLACKBOX_PERSIST_CUSTOM
 #error "BLACKBOX_PERSIST_CUSTOM backend is not wired yet"
 #endif
@@ -219,6 +216,124 @@ void blackbox_deinit(blackbox_handle_t *h);
 #if BLACKBOX_PERSIST == BLACKBOX_PERSIST_FILE
 typedef struct { const char *path; } blackbox_file_be_t;
 #endif
+
+/* -------- ESP_FLASH backend: a circular append-log over a dedicated esp32 flash partition -------
+ * Layout: the partition is a ring of 4 KB sectors. Each sector opens with a header {magic, seq};
+ * seq is a monotonic lap counter so recovery can order sectors oldest→newest independent of their
+ * physical position. Records pack after the header as [u16 len][payload] (the CSV line, no newline);
+ * a record never spans a sector. Appending past a sector's end advances to the next sector (circular),
+ * ERASES it first — which evicts its old records, so expiry-by-size is free — and stamps a new header.
+ * Recovery on boot scans sector headers for the highest seq (write sector) and lowest (oldest), then
+ * walks the write sector to find the free slot (w_off). pull() reads oldest→newest via a byte cursor. */
+#if BLACKBOX_PERSIST == BLACKBOX_PERSIST_ESP_FLASH
+#include "esp_partition.h"
+
+#define BLACKBOX_FLASH_SECTOR    4096u
+#define BLACKBOX_FLASH_SEC_MAGIC 0x42584F42u      /* 'BXOB' — sector header magic          */
+#define BLACKBOX_FLASH_HDR       8u               /* per-sector header: magic(4) + seq(4)  */
+#define BLACKBOX_FLASH_ERASED    0xFFFFu          /* an erased [u16 len] cell (fresh NOR)  */
+
+typedef struct {
+    const esp_partition_t *part;
+    uint32_t nsec;        /* sectors in the partition                  */
+    uint32_t w_off;       /* absolute offset of the next append        */
+    uint32_t w_seq;       /* seq stamped on the current write sector   */
+    uint32_t oldest_sec;  /* physical index of the oldest live sector  */
+    bool     has_data;    /* any record present in the log             */
+} blackbox_flash_be_t;
+
+static void blackbox__flash_hdr_write(const esp_partition_t *p, uint32_t sec_off, uint32_t seq) {
+    uint8_t hdr[BLACKBOX_FLASH_HDR];
+    const uint32_t m = BLACKBOX_FLASH_SEC_MAGIC;
+    memcpy(hdr, &m, 4); memcpy(hdr + 4, &seq, 4);
+    (void)esp_partition_write(p, sec_off, hdr, BLACKBOX_FLASH_HDR);
+}
+
+/* Records in one sector (walk framed cells until an erased/zero len, or the sector fills). */
+static uint32_t blackbox__flash_sec_records(const esp_partition_t *p, uint32_t sec_off, uint32_t *bytes, uint32_t *end_off) {
+    uint32_t off = sec_off + BLACKBOX_FLASH_HDR;
+    const uint32_t end = sec_off + BLACKBOX_FLASH_SECTOR;
+    uint32_t n = 0, b = 0;
+    while (off + 2u <= end) {
+        uint16_t len = 0;
+        (void)esp_partition_read(p, off, &len, 2);
+        if (len == BLACKBOX_FLASH_ERASED || len == 0 || off + 2u + (uint32_t)len > end) break;
+        n++; b += (uint32_t)len; off += 2u + (uint32_t)len;
+    }
+    if (bytes)   *bytes = b;
+    if (end_off) *end_off = off;                  /* first free slot in this sector */
+    return n;
+}
+
+/* Boot recovery: find the write sector (max seq) + oldest sector (min seq), the write offset, and a
+ * live record/byte count. Virgin partition → lay down sector 0. Sets h->count / h->stored_bytes. */
+static void blackbox__flash_recover(blackbox_handle_t *h) {
+    blackbox_flash_be_t *be = (blackbox_flash_be_t *)h->be;
+    bool any = false;
+    uint32_t best_seq = 0, best_end = BLACKBOX_FLASH_HDR;
+    uint32_t min_seq = 0, min_sec = 0, total = 0, bytes = 0;
+    for (uint32_t s = 0; s < be->nsec; s++) {
+        const uint32_t off = s * BLACKBOX_FLASH_SECTOR;
+        uint32_t magic = 0, seq = 0;
+        (void)esp_partition_read(be->part, off, &magic, 4);
+        (void)esp_partition_read(be->part, off + 4, &seq, 4);
+        if (magic != BLACKBOX_FLASH_SEC_MAGIC) continue;
+        uint32_t sb = 0, se = 0;
+        total += blackbox__flash_sec_records(be->part, off, &sb, &se);
+        bytes += sb;
+        if (!any) { any = true; best_seq = min_seq = seq; min_sec = s; best_end = se; }
+        else {
+            if (seq > best_seq) { best_seq = seq; best_end = se; }
+            if (seq < min_seq)  { min_seq = seq;  min_sec = s; }
+        }
+    }
+    if (!any) {                                   /* virgin partition — lay down sector 0 */
+        be->w_seq = 1; be->oldest_sec = 0; be->has_data = false;
+        (void)esp_partition_erase_range(be->part, 0, BLACKBOX_FLASH_SECTOR);
+        blackbox__flash_hdr_write(be->part, 0, be->w_seq);
+        be->w_off = BLACKBOX_FLASH_HDR;
+        return;
+    }
+    be->w_seq      = best_seq;
+    be->oldest_sec = min_sec;
+    be->w_off      = best_end;                     /* end_off from flash_sec_records is absolute */
+    be->has_data   = (total > 0);
+    h->count       = total;
+    h->stored_bytes = bytes;
+}
+
+/* Append one framed record; on sector advance, evict the sector being reused (adjust count/bytes). */
+static int blackbox__flash_append(blackbox_handle_t *h, const char *payload, uint16_t len) {
+    blackbox_flash_be_t *be = (blackbox_flash_be_t *)h->be;
+    const uint32_t rec = 2u + (uint32_t)len;
+    if (rec > BLACKBOX_FLASH_SECTOR - BLACKBOX_FLASH_HDR) return -1;   /* one record must fit a sector */
+    /* Current sector = the one holding the last written byte (w_off-1); this makes an exactly-full
+       sector (w_off == sector end) resolve to that sector and advance, instead of aliasing to the
+       next sector's header. w_off is always >= BLACKBOX_FLASH_HDR, so w_off-1 never underflows. */
+    const uint32_t sec_off = (be->w_off - 1u) & ~(BLACKBOX_FLASH_SECTOR - 1u);
+    if (be->w_off + rec > sec_off + BLACKBOX_FLASH_SECTOR) {           /* no room → advance a sector */
+        const uint32_t cur = sec_off / BLACKBOX_FLASH_SECTOR;
+        const uint32_t nxt = (cur + 1u) % be->nsec;
+        const uint32_t nxt_off = nxt * BLACKBOX_FLASH_SECTOR;
+        if (nxt == be->oldest_sec) {                                  /* reusing the oldest → evict it */
+            uint32_t eb = 0;
+            const uint32_t er = blackbox__flash_sec_records(be->part, nxt_off, &eb, NULL);
+            h->count        = (h->count > er) ? h->count - er : 0;
+            h->stored_bytes = (h->stored_bytes > eb) ? h->stored_bytes - eb : 0;
+            be->oldest_sec  = (be->oldest_sec + 1u) % be->nsec;
+        }
+        if (esp_partition_erase_range(be->part, nxt_off, BLACKBOX_FLASH_SECTOR) != ESP_OK) return -1;
+        be->w_seq += 1u;
+        blackbox__flash_hdr_write(be->part, nxt_off, be->w_seq);
+        be->w_off = nxt_off + BLACKBOX_FLASH_HDR;
+    }
+    if (esp_partition_write(be->part, be->w_off, &len, 2) != ESP_OK) return -1;
+    if (len && esp_partition_write(be->part, be->w_off + 2u, payload, len) != ESP_OK) return -1;
+    be->w_off += rec;
+    be->has_data = true;
+    return 0;
+}
+#endif /* BLACKBOX_PERSIST_ESP_FLASH */
 
 /* Pool canaries: a survivability header at the front and a guard word at the back. Both hold the
  * magic; the front also holds the record length. Purposes: (1) on init, an intact pool that survived
@@ -281,7 +396,7 @@ static uint32_t blackbox__pool_lines(const blackbox_handle_t *h) {
     return n;
 }
 
-#if BLACKBOX_PERSIST != BLACKBOX_PERSIST_FILE
+#if BLACKBOX_PERSIST == BLACKBOX_PERSIST_NONE
 /* Evict the single oldest whole line from the record area (NONE ring / bound). */
 static void blackbox__evict_oldest(blackbox_handle_t *h) {
     if (h->pool_len == 0) return;
@@ -306,8 +421,8 @@ static void blackbox__enforce_bound(blackbox_handle_t *h) {
 static int blackbox__store_append(blackbox_handle_t *h, const char *line, size_t ln) {
     if (ln == 0 || ln > h->pool_cap)
         return -1;
-#if BLACKBOX_PERSIST == BLACKBOX_PERSIST_FILE
-    if (h->pool_len + ln > h->pool_cap)         /* stage full → drain to the file first */
+#if BLACKBOX_PERSIST != BLACKBOX_PERSIST_NONE
+    if (h->pool_len + ln > h->pool_cap)         /* stage full → drain to the backend first */
         if (blackbox_flush(h) != 0)
             return -1;
     if (h->pool_len + ln > h->pool_cap)         /* still no room (shouldn't happen) */
@@ -322,8 +437,8 @@ static int blackbox__store_append(blackbox_handle_t *h, const char *line, size_t
     h->pool_len += ln;
     h->count++;
     h->stored_bytes += (uint32_t)ln;
-#if BLACKBOX_PERSIST != BLACKBOX_PERSIST_FILE
-    blackbox__enforce_bound(h);                 /* honour max_records / max_bytes */
+#if BLACKBOX_PERSIST == BLACKBOX_PERSIST_NONE
+    blackbox__enforce_bound(h);                 /* honour max_records / max_bytes (RAM ring) */
 #endif
     blackbox__pool_sync(h);
     return 0;
@@ -347,6 +462,16 @@ int blackbox_init(blackbox_handle_t *h, const blackbox_config_t *cfg) {
     if (!f) { free(be); return -1; }
     (void)fclose(f);
     h->be = be;
+#elif BLACKBOX_PERSIST == BLACKBOX_PERSIST_ESP_FLASH
+    blackbox_flash_be_t *fbe = (blackbox_flash_be_t *)calloc(1, sizeof(*fbe));
+    if (!fbe) return -1;
+    fbe->part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                         (esp_partition_subtype_t)0x40,   /* iotdata diag subtype */
+                                         cfg->persist_arg ? cfg->persist_arg : "diag");
+    if (!fbe->part || fbe->part->size < BLACKBOX_FLASH_SECTOR) { free(fbe); return -1; }
+    fbe->nsec = (uint32_t)(fbe->part->size / BLACKBOX_FLASH_SECTOR);
+    h->be = fbe;
+    blackbox__flash_recover(h);                 /* find write/oldest cursor + live count */
 #endif
     /* Adopt a surviving pool (intact canaries — e.g. RTC RAM across deep sleep / a fault), else
      * start fresh (normal RAM boots to garbage → canaries don't match → fresh). */
@@ -457,6 +582,23 @@ int blackbox_flush(blackbox_handle_t *h) {
     h->pool_len = 0;                            /* staged bytes are now durable in the file */
     h->flushes++;
     blackbox__pool_sync(h);
+#elif BLACKBOX_PERSIST == BLACKBOX_PERSIST_ESP_FLASH
+    if (h->pool_len == 0) return 0;
+    /* Drain the staged pool to the flash log, one framed record per CSV line. Sector eviction
+       (expiry-by-size) happens inside blackbox__flash_append as the log wraps. */
+    const char *p = h->pool_base;
+    size_t left = h->pool_len;
+    while (left > 0) {
+        const char *nl = (const char *)memchr(p, '\n', left);
+        size_t ll = nl ? (size_t)(nl - p) : left;          /* payload length, no newline */
+        if (ll > 0xFFFFu) ll = 0xFFFFu;                    /* lines are ≤ LINE_MAX; clamp defensively */
+        if (blackbox__flash_append(h, p, (uint16_t)ll) != 0) return -1;
+        const size_t adv = nl ? ll + 1u : ll;              /* consume the newline too */
+        p += adv; left -= adv;
+    }
+    h->pool_len = 0;                            /* staged bytes are now durable in flash */
+    h->flushes++;
+    blackbox__pool_sync(h);
 #else
     (void)h;                                    /* PERSIST_NONE — the pool already IS the store */
 #endif
@@ -475,6 +617,33 @@ int blackbox_pull(blackbox_handle_t *h, size_t *cursor, char *line, size_t n) {
     if (!g) { (void)fclose(f); return 0; }
     *cursor = (size_t)ftell(f);
     (void)fclose(f);
+#elif BLACKBOX_PERSIST == BLACKBOX_PERSIST_ESP_FLASH
+    blackbox_flash_be_t *be = (blackbox_flash_be_t *)h->be;
+    if (*cursor == 0) {
+        (void)blackbox_flush(h);                /* make staged records visible to the read */
+        if (!be->has_data) return 0;
+        *cursor = (size_t)be->oldest_sec * BLACKBOX_FLASH_SECTOR + BLACKBOX_FLASH_HDR;
+    }
+    for (;;) {                                  /* walk oldest→newest, skipping sector headers/gaps */
+        if ((uint32_t)*cursor == be->w_off) return 0;   /* reached the write head → done */
+        const uint32_t sec_off = (uint32_t)(*cursor - 1u) & ~(BLACKBOX_FLASH_SECTOR - 1u);  /* sector of the last byte */
+        const uint32_t end = sec_off + BLACKBOX_FLASH_SECTOR;
+        uint16_t len = 0;
+        if ((uint32_t)*cursor + 2u <= end)
+            (void)esp_partition_read(be->part, (uint32_t)*cursor, &len, 2);
+        if ((uint32_t)*cursor + 2u > end || len == BLACKBOX_FLASH_ERASED || len == 0
+            || (uint32_t)*cursor + 2u + (uint32_t)len > end) {   /* no more records here → next sector in seq order */
+            const uint32_t nxt = (sec_off / BLACKBOX_FLASH_SECTOR + 1u) % be->nsec;
+            if (nxt == be->oldest_sec) return 0;         /* wrapped all the way round → done */
+            *cursor = (size_t)nxt * BLACKBOX_FLASH_SECTOR + BLACKBOX_FLASH_HDR;
+            continue;
+        }
+        const uint32_t copy = ((uint32_t)len < (uint32_t)(n - 1)) ? (uint32_t)len : (uint32_t)(n - 1);
+        (void)esp_partition_read(be->part, (uint32_t)*cursor + 2u, line, copy);
+        line[copy] = '\0';
+        *cursor += 2u + (size_t)len;
+        return (int)strlen(line);               /* stored without a newline — nothing to strip */
+    }
 #else
     if (*cursor >= h->pool_len) return 0;
     const char *base = h->pool_base + *cursor;
@@ -501,15 +670,22 @@ void blackbox_clear(blackbox_handle_t *h) {
     blackbox_file_be_t *be = (blackbox_file_be_t *)h->be;
     FILE *f = fopen(be->path, "w");             /* truncate */
     if (f) (void)fclose(f);
+#elif BLACKBOX_PERSIST == BLACKBOX_PERSIST_ESP_FLASH
+    blackbox_flash_be_t *be = (blackbox_flash_be_t *)h->be;
+    (void)esp_partition_erase_range(be->part, 0, (size_t)be->nsec * BLACKBOX_FLASH_SECTOR);
+    be->w_seq = 1; be->oldest_sec = 0; be->has_data = false;
+    blackbox__flash_hdr_write(be->part, 0, be->w_seq);   /* re-lay sector 0 */
+    be->w_off = BLACKBOX_FLASH_HDR;
 #endif
 }
 
 void blackbox_expire(blackbox_handle_t *h) {
     if (!h) return;
-#if BLACKBOX_PERSIST == BLACKBOX_PERSIST_FILE
-    (void)blackbox_flush(h);        /* flush enforces the byte bound (rotation) */
+#if BLACKBOX_PERSIST != BLACKBOX_PERSIST_NONE
+    (void)blackbox_flush(h);        /* FILE: rotation enforces the byte bound. ESP_FLASH: the log
+                                       self-evicts by sector as it wraps — flush just persists staged. */
 #else
-    blackbox__enforce_bound(h);     /* evict oldest to fit max_records / max_bytes */
+    blackbox__enforce_bound(h);     /* NONE: evict oldest to fit max_records / max_bytes */
 #endif
 }
 
@@ -603,8 +779,8 @@ void blackbox_filter_clear(blackbox_handle_t *h) {
 
 void blackbox_deinit(blackbox_handle_t *h) {
     if (!h) return;
-#if BLACKBOX_PERSIST == BLACKBOX_PERSIST_FILE
-    if (h->be) { free(h->be); h->be = NULL; }
+#if BLACKBOX_PERSIST != BLACKBOX_PERSIST_NONE
+    if (h->be) { free(h->be); h->be = NULL; }   /* FILE + ESP_FLASH allocate a backend struct */
 #endif
     h->cfg = NULL;
 }

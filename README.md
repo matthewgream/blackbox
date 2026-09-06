@@ -12,7 +12,7 @@ See [DESIGN.md](DESIGN.md) for the full design.
 
 ## Build & test
 ```
-make test          # runs the C library test against PERSIST_NONE and PERSIST_FILE
+make test          # C library test against PERSIST_NONE, PERSIST_FILE, and PERSIST_ESP_FLASH (mock)
 make csv2json-test # runs csv2json over the example fixtures
 ```
 
@@ -97,7 +97,10 @@ to cut erase cycles, and **bound** to cap the footprint.
 - **NONE** — the RAM pool *is* the store (a ring; oldest evicted when full). On esp32 the pool can be
   an `RTC_NOINIT` buffer, so records survive deep sleep; dumped over USB. No flash wear.
 - **FILE** — pool stages, `flush` appends to a file (host).
-- **ESP_FLASH** — circular append-log in a dedicated esp32 flash partition. *Planned (P3).*
+- **ESP_FLASH** — circular append-log in a dedicated esp32 flash partition (`esp_partition`). Records
+  are `[u16 len][payload]` packed into 4 KB sectors headed by `{magic, seq}`; the log wraps and erases
+  the next sector as it goes, so expiry-by-size is free. Boot recovery scans sector seqs to find the
+  write/oldest cursor. Exercised on the host via a RAM-backed `esp_partition` mock (`make test-flash`).
 
 ## Pool integrity & survivability
 The pool carries **guard-band canaries** — a magic + staged-length header at the front and a magic at

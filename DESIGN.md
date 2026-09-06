@@ -313,7 +313,10 @@ Then: add more record types per device — the shared **lifecycle** record is th
 
 ## 12. P1 implementation notes (this repo)
 - **Backends implemented:** `NONE` (pool-as-ring; on esp32 an `RTC_NOINIT` pool → survives deep
-  sleep) and `FILE` (host). `ESP_FLASH` and `CUSTOM` `#error` for now (P3) so a misconfig fails loud.
+  sleep), `FILE` (host), and `ESP_FLASH` (esp32 circular append-log over an `esp_partition`; §6).
+  `ESP_FLASH` is exercised on the host through a RAM-backed `esp_partition` mock (`make test-flash`) —
+  round-trip, circular wrap + eviction, and boot recovery — but still wants a real-device build to
+  confirm the `esp_partition` calls. `CUSTOM` `#error`s so a misconfig fails loud.
 - **Default is DISABLED** — `blackbox_enable(h, true)` to opt in.
 - **Tag filtering (implemented):** tags are capped at `BLACKBOX_TAG_MAX` chars (default 8→uint64, or
   4→uint32) and packed into that integer, so `blackbox_filter_mode/add/remove/clear` do include/exclude
