@@ -102,6 +102,36 @@ to cut erase cycles, and **bound** to cap the footprint.
   the next sector as it goes, so expiry-by-size is free. Boot recovery scans sector seqs to find the
   write/oldest cursor. Exercised on the host via a RAM-backed `esp_partition` mock (`make test-flash`).
 
+## Pulling an ESP_FLASH log off a device
+The partition can be read straight out of the chip over USB with **esptool alone** — no ESP-IDF
+toolchain — which is the fast path for a field unit (and much quicker than streaming records over the
+console). `py/blackbox_esp_flash.py` turns that raw image back into the CSV lines:
+```
+python -m esptool --port /dev/ttyACM0 read-flash 0x320000 0xe0000 diag.bin   # offsets from your map
+./py/blackbox_esp_flash.py diag.bin > diag.csv                               # oldest record first
+./py/blackbox_esp_flash.py diag.bin | node js/csv2json.js --definitions=records.h
+```
+Two caveats: reading flash **resets the device** (esptool drives it into download mode), so flush any
+staged records first; and with `BLACKBOX_FLUSH_BATCH_*` whatever is still in the RAM pool is not in the
+image yet.
+
+### On-flash format
+The image is *not* readable text — records are framed, sectors are in ring order, and free space is
+erased `0xFF`. Any decoder needs this (all integers little-endian):
+
+| | |
+|---|---|
+| partition | N × 4096-byte sectors, used as a ring |
+| sector | `[magic u32][seq u32]` then records packed forward; a record never spans a sector |
+| `magic` | `0x42584F42` (`'BXOB'`); a sector without it was never written |
+| `seq` | monotonic lap counter — **sort sectors by `seq` for chronological order** across the wrap |
+| record | `[len u16][payload]`, payload = one CSV line **without** its trailing newline |
+| sector end | `len == 0xFFFF` (erased cell) or `len == 0`, or a length that would overrun the sector |
+
+This table is the contract for out-of-tree decoders. `iotdata`'s `esp32-deploy` tool implements the
+same walk independently (`esp32-deploy diag extract`) rather than importing this module, so that it
+stays dependency-free on a bare target host — if the format ever changes, both must move together.
+
 ## Pool integrity & survivability
 The pool carries **guard-band canaries** — a magic + staged-length header at the front and a magic at
 the back — regardless of backend or platform. They serve two ends:
