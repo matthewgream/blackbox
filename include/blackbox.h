@@ -458,9 +458,11 @@ int blackbox_init(blackbox_handle_t *h, const blackbox_config_t *cfg) {
     blackbox_file_be_t *be = (blackbox_file_be_t *)calloc(1, sizeof(*be));
     if (!be) return -1;
     be->path = cfg->persist_arg ? cfg->persist_arg : "blackbox.csv";
-    FILE *f = fopen(be->path, "a");             /* ensure it exists / is appendable */
-    if (!f) { free(be); return -1; }
-    (void)fclose(f);
+    /* The file is NOT created here. It used to be opened for append just to prove the path was
+       writable, which left an empty file behind on every run -- including runs with the recorder
+       disabled, which never write anything at all. The flush path opens with "a" and creates it
+       there, so the file now appears on the first record actually persisted and not before.
+       The cost is that an unwritable path is reported by the first flush rather than by init. */
     h->be = be;
 #elif BLACKBOX_PERSIST == BLACKBOX_PERSIST_ESP_FLASH
     blackbox_flash_be_t *fbe = (blackbox_flash_be_t *)calloc(1, sizeof(*fbe));

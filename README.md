@@ -128,8 +128,8 @@ erased `0xFF`. Any decoder needs this (all integers little-endian):
 | record | `[len u16][payload]`, payload = one CSV line **without** its trailing newline |
 | sector end | `len == 0xFFFF` (erased cell) or `len == 0`, or a length that would overrun the sector |
 
-This table is the contract for out-of-tree decoders. `iotdata`'s `esp32-deploy` tool implements the
-same walk independently (`esp32-deploy diag extract`) rather than importing this module, so that it
+This table is the contract for out-of-tree decoders. `iotdata`'s `esp32-tool` implements the
+same walk independently (`esp32-tool diag extract`) rather than importing this module, so that it
 stays dependency-free on a bare target host — if the format ever changes, both must move together.
 
 ## Pool integrity & survivability
