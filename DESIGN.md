@@ -12,7 +12,7 @@ JSON by reading the project's record header). **Delivery is out of scope for now
 collectors, viewers — parked, §11). Storage is compact CSV; JSON appears only at a read boundary,
 off-device.
 
-*iotdata is one consumer.* Its adapter `iotdata-common/include/iotdata_blackbox.h` provides only the
+*iotdata is one consumer.* Its adapter `iotdata-platform/include/iotdata_blackbox.h` provides only the
 **backend + clock commonality** (esp32 → esp-flash partition, linux → file; the iotdata clock
 convention) and `#include`s blackbox. It does **not** define records — each project (relay, gateway,
 sensor, sds, tsa) defines its own, because what each records differs. The journal **complements**
@@ -55,7 +55,7 @@ iotdata-depend/blackbox/                    PUBLIC · generic · zero iotdata kn
   js/csv2json      JS module (+ thin CLI): reads a record header → converts CSV records to JSON
   (delivery — mqtt bridges, collectors, viewers — deliberately OUT for now)
         ▲  #include + compile-time config
-iotdata-common/include/iotdata_blackbox.h   iotdata ADAPTER = backends + sizes + clock + 1 common record
+iotdata-platform/include/iotdata_blackbox.h iotdata ADAPTER = backends + sizes + clock + 1 common record
   • #if ESP_PLATFORM → persist = esp-flash("diag"),  pool = RTC RAM (extern);   default SIZES here
     #elif __linux__  → persist = FILE,                pool = heap RAM;            default SIZES here
     (all guarded by #ifndef → a project can override a backend/size before including)
@@ -278,7 +278,7 @@ Same API + descriptors everywhere; only `config` + the `#define`s differ.
 
 **Pieces & responsibilities**
 1. **`iotdata-depend/blackbox`** (public) — the C recorder + the esp-flash esp32 backend + `csv2json`.
-2. **`iotdata-common/include/iotdata_blackbox.h`** — platform backends + pool + **sizes** (esp32:
+2. **`iotdata-platform/include/iotdata_blackbox.h`** — platform backends + pool + **sizes** (esp32:
    esp-flash + RTC pool; linux: file + heap pool) + the iotdata clock, and the one common
    **lifecycle** record (start/stop/…).
 3. **Each project** — a header/section that: `#include`s the adapter; declares its **domain record
